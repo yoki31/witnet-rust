@@ -4,7 +4,7 @@ version = "0.4.0"
 authors = ["Witnet Foundation <info@witnet.foundation>"]
 workspace = ".."
 description = "node component"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 actix = { version = "0.12.0", default-features = false }
@@ -22,7 +22,6 @@ jsonrpc-pubsub = "15.1.0"
 log = "0.4.8"
 rand = "0.7.3"
 pin-project-lite = "0.2"
-secp256k1 = "0.17.2"
 sentry = { version = "0.23", features = ["log"], optional = true }
 serde = { version = "1.0.104", features = ["derive"] }
 serde_json = "1.0.47"
@@ -37,7 +36,7 @@ witnet_futures_utils = { path = "../futures_utils" }
 witnet_p2p = { path = "../p2p" }
 witnet_protected = { path = "../protected", features = ["with-serde"]  }
 witnet_rad = { path = "../rad" }
-witnet_storage = { path = "../storage", features = ["rocksdb-backend", "crypto-backend"] }
+witnet_storage = { path = "../storage", features = ["rocksdb-backend"] }
 witnet_util = { path = "../util" }
 witnet_validations = { path = "../validations" }
 

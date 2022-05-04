@@ -1,7 +1,7 @@
 use crate::{
     actors::{
         dr_database::{DrDatabase, DrInfoBridge, DrState, GetAllNewDrs, SetDrInfoBridge},
-        dr_reporter::{DrReporter, DrReporterMsg},
+        dr_reporter::{DrReporter, DrReporterMsg, Report},
     },
     config::Config,
 };
@@ -15,6 +15,7 @@ use witnet_data_structures::{
     radon_error::RadonErrors,
 };
 use witnet_net::client::tcp::{jsonrpc, JsonRpcClient};
+use witnet_node::utils::stop_system_if_panicking;
 use witnet_util::timestamp::get_timestamp;
 use witnet_validations::validations::{validate_data_request_output, validate_rad_request};
 
@@ -27,6 +28,13 @@ pub struct DrSender {
     witnet_client: Option<Addr<JsonRpcClient>>,
     wit_dr_sender_polling_rate_ms: u64,
     max_dr_value_nanowits: u64,
+}
+
+impl Drop for DrSender {
+    fn drop(&mut self) {
+        log::trace!("Dropping DrSender");
+        stop_system_if_panicking("DrSender");
+    }
 }
 
 /// Make actor from DrSender
@@ -74,6 +82,7 @@ impl DrSender {
             let dr_reporter_addr = DrReporter::from_registry();
 
             let new_drs = dr_database_addr.send(GetAllNewDrs).await.unwrap().unwrap();
+            let mut dr_reporter_msgs = vec![];
 
             for (dr_id, dr_bytes) in new_drs {
                 match deserialize_and_validate_dr_bytes(&dr_bytes, max_dr_value_nanowits) {
@@ -140,18 +149,22 @@ impl DrSender {
                                 .parse()
                                 .unwrap();
 
-                        dr_reporter_addr
-                            .send(DrReporterMsg {
-                                dr_id,
-                                dr_bytes,
-                                dr_tx_hash,
-                                result,
-                            })
-                            .await
-                            .unwrap();
+                        dr_reporter_msgs.push(Report {
+                            dr_id,
+                            timestamp: 0,
+                            dr_tx_hash,
+                            result,
+                        });
                     }
                 }
             }
+
+            dr_reporter_addr
+                .send(DrReporterMsg {
+                    reports: dr_reporter_msgs,
+                })
+                .await
+                .unwrap();
         };
 
         ctx.spawn(fut.into_actor(self).then(move |(), _act, ctx| {

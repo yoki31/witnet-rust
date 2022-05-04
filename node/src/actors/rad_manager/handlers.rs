@@ -1,17 +1,22 @@
 //! Message handlers for `RadManager`
 
-use actix::{Handler, ResponseFuture};
 use std::time::Duration;
+
+use actix::{Handler, ResponseFuture};
+use futures::FutureExt;
+
 use witnet_data_structures::radon_report::{RadonReport, ReportContext};
-use witnet_rad::{error::RadError, script::RadonScriptExecutionSettings, types::RadonTypes};
-use witnet_validations::validations::{
-    evaluate_tally_precondition_clause, run_tally, TallyPreconditionClauseResult,
+use witnet_rad::{
+    conditions::{evaluate_tally_precondition_clause, TallyPreconditionClauseResult},
+    error::RadError,
+    script::RadonScriptExecutionSettings,
+    types::RadonTypes,
 };
+use witnet_validations::validations::run_tally;
 
 use crate::actors::messages::{ResolveRA, RunTally};
 
 use super::RadManager;
-use futures::FutureExt;
 
 // This constant is used to ensure that a RetrievalTimeoutError is committed after 10 seconds
 // This value must be lower than half an epoch, and having enough time to broadcasting the commit.
@@ -24,7 +29,7 @@ impl Handler<ResolveRA> for RadManager {
     fn handle(&mut self, msg: ResolveRA, _ctx: &mut Self::Context) -> Self::Result {
         // The result of the RAD aggregation is computed asynchronously, because the async block
         // returns a future
-        let fut = async {
+        let fut = async move {
             let sources = msg.rad_request.retrieve;
             let aggregator = msg.rad_request.aggregate;
             let active_wips = msg.active_wips.clone();
@@ -102,7 +107,7 @@ impl Handler<RunTally> for RadManager {
     type Result = ResponseFuture<RadonReport<RadonTypes>>;
 
     fn handle(&mut self, msg: RunTally, _ctx: &mut Self::Context) -> Self::Result {
-        let fut = async {
+        let fut = async move {
             run_tally(
                 msg.reports,
                 &msg.script,
@@ -118,9 +123,11 @@ impl Handler<RunTally> for RadManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::utils::test_actix_system;
     use actix::{Actor, MailboxError, Message};
+
+    use crate::utils::test_actix_system;
+
+    use super::*;
 
     #[test]
     fn rad_manager_handler_can_panic() {

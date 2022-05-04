@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 use witnet_crypto::key::KeyPath;
 use witnet_data_structures::{
     chain::{
-        Block, DataRequestOutput, Epoch, Hash, Hashable, PublicKeyHash, StateMachine, SyncStatus,
+        Block, DataRequestOutput, Epoch, Hash, Hashable, PublicKeyHash, RADType, StateMachine,
+        SyncStatus,
     },
+    mainnet_validations::ActiveWips,
     transaction::Transaction,
     vrf::VrfMessage,
 };
@@ -536,9 +538,7 @@ pub async fn get_block_chain(
     }
 
     fn convert_negative_to_positive_with_negative_flag(x: i64) -> Result<(u32, bool), String> {
-        // TODO: after Rust 1.51, use unsigned_abs instead of wrapping_abs and remove this allow
-        #[allow(clippy::cast_sign_loss)]
-        let positive_x = u32::try_from(x.wrapping_abs() as u64).map_err(|_e| {
+        let positive_x = u32::try_from(x.unsigned_abs()).map_err(|_e| {
             format!(
                 "out of bounds: {} must be between -{} and {} inclusive",
                 x,
@@ -652,7 +652,7 @@ pub async fn get_block(params: Params) -> Result<Value, jsonrpc_core::Error> {
         .await;
 
     match res {
-        Ok(Ok(output)) => {
+        Ok(Ok(mut output)) => {
             let block_epoch = output.block_header.beacon.checkpoint;
             let block_hash = output.hash();
 
@@ -702,6 +702,38 @@ pub async fn get_block(params: Params) -> Result<Value, jsonrpc_core::Error> {
             } else {
                 None
             };
+
+            // Check if there were data request transactions included in the block which require RADType replacement
+            // It is imperative to apply this after the transaction hash calculation to conserve the correct hashes
+            if !output.txns.data_request_txns.is_empty() {
+                // Create Active WIPs
+                let signaling_info = ChainManager::from_registry()
+                    .send(GetSignalingInfo {})
+                    .await;
+                let active_wips = match signaling_info {
+                    Ok(Ok(wips)) => ActiveWips {
+                        active_wips: wips.active_upgrades,
+                        block_epoch,
+                    },
+                    Ok(Err(e)) => {
+                        let err = internal_error(e);
+                        return Err(err);
+                    }
+                    Err(e) => {
+                        let err = internal_error(e);
+                        return Err(err);
+                    }
+                };
+
+                if !active_wips.wip0019() {
+                    // Replace RADType::Unknown with RADType::HttpGet for all epochs before the activation of WIP0019
+                    for dr_txn in &mut output.txns.data_request_txns {
+                        for retrieve in &mut dr_txn.body.dr_output.data_request.retrieve {
+                            retrieve.kind = RADType::HttpGet
+                        }
+                    }
+                }
+            }
 
             let mut value = match serde_json::to_value(output) {
                 Ok(x) => x,
@@ -770,6 +802,9 @@ pub struct GetTransactionOutput {
     /// Hash of the block that contains this transaction in hex format,
     /// or "pending" if the transaction has not been included in any block yet
     pub block_hash: String,
+    /// Epoch of the block that contains this transaction, or None if the transaction has not been
+    /// included in any block yet
+    pub block_epoch: Option<Epoch>,
     /// True if the block that includes this transaction has been confirmed by a superblock
     pub confirmed: bool,
 }
@@ -806,10 +841,45 @@ pub async fn get_transaction(hash: Result<(Hash,), jsonrpc_core::Error>) -> Json
                     return Err(internal_error(e));
                 }
             };
+
+            let new_transaction = match transaction {
+                Transaction::DataRequest(mut dr_txn) => {
+                    // Create Active WIPs
+                    let signaling_info = ChainManager::from_registry()
+                        .send(GetSignalingInfo {})
+                        .await;
+                    let active_wips = match signaling_info {
+                        Ok(Ok(wips)) => ActiveWips {
+                            active_wips: wips.active_upgrades,
+                            block_epoch,
+                        },
+                        Ok(Err(e)) => {
+                            let err = internal_error(e);
+                            return Err(err);
+                        }
+                        Err(e) => {
+                            let err = internal_error(e);
+                            return Err(err);
+                        }
+                    };
+
+                    if !active_wips.wip0019() {
+                        // Replace RADType::Unknown with RADType::HttpGet for all epochs before the activation of WIP0019
+                        for retrieve in &mut dr_txn.body.dr_output.data_request.retrieve {
+                            retrieve.kind = RADType::HttpGet
+                        }
+                    }
+
+                    Transaction::DataRequest(dr_txn)
+                }
+                _ => transaction,
+            };
+
             let output = GetTransactionOutput {
-                transaction,
+                transaction: new_transaction,
                 weight,
                 block_hash: block_hash.to_string(),
+                block_epoch: Some(block_epoch),
                 confirmed,
             };
             let value = match serde_json::to_value(output) {
@@ -834,6 +904,7 @@ pub async fn get_transaction(hash: Result<(Hash,), jsonrpc_core::Error>) -> Json
                         transaction,
                         weight,
                         block_hash: "pending".to_string(),
+                        block_epoch: None,
                         confirmed: false,
                     };
                     let value = match serde_json::to_value(output) {
@@ -1868,7 +1939,7 @@ mod tests {
         let block = block_example();
         let inv_elem = InventoryItem::Block(block);
         let s = serde_json::to_string(&inv_elem).unwrap();
-        let expected = r#"{"block":{"block_header":{"signals":0,"beacon":{"checkpoint":0,"hashPrevBlock":"0000000000000000000000000000000000000000000000000000000000000000"},"merkle_roots":{"mint_hash":"0000000000000000000000000000000000000000000000000000000000000000","vt_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","dr_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","commit_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","reveal_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","tally_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000"},"proof":{"proof":{"proof":[],"public_key":{"compressed":0,"bytes":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}},"bn256_public_key":null},"block_sig":{"signature":{"Secp256k1":{"der":[]}},"public_key":{"compressed":0,"bytes":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}},"txns":{"mint":{"epoch":0,"outputs":[]},"value_transfer_txns":[],"data_request_txns":[{"body":{"inputs":[{"output_pointer":"0000000000000000000000000000000000000000000000000000000000000000:0"}],"outputs":[{"pkh":"wit1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwrt3a4","value":0,"time_lock":0}],"dr_output":{"data_request":{"time_lock":0,"retrieve":[{"kind":"HTTP-GET","url":"https://openweathermap.org/data/2.5/weather?id=2950159&appid=b6907d289e10d714a6e88b30761fae22","script":[]},{"kind":"HTTP-GET","url":"https://openweathermap.org/data/2.5/weather?id=2950159&appid=b6907d289e10d714a6e88b30761fae22","script":[]}],"aggregate":{"filters":[],"reducer":0},"tally":{"filters":[],"reducer":0}},"witness_reward":0,"witnesses":0,"commit_and_reveal_fee":0,"min_consensus_percentage":0,"collateral":0}},"signatures":[{"signature":{"Secp256k1":{"der":[]}},"public_key":{"compressed":0,"bytes":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}]}],"commit_txns":[],"reveal_txns":[],"tally_txns":[]}}}"#;
+        let expected = r#"{"block":{"block_header":{"signals":0,"beacon":{"checkpoint":0,"hashPrevBlock":"0000000000000000000000000000000000000000000000000000000000000000"},"merkle_roots":{"mint_hash":"0000000000000000000000000000000000000000000000000000000000000000","vt_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","dr_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","commit_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","reveal_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","tally_hash_merkle_root":"0000000000000000000000000000000000000000000000000000000000000000"},"proof":{"proof":{"proof":[],"public_key":{"compressed":0,"bytes":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}},"bn256_public_key":null},"block_sig":{"signature":{"Secp256k1":{"der":[]}},"public_key":{"compressed":0,"bytes":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}},"txns":{"mint":{"epoch":0,"outputs":[]},"value_transfer_txns":[],"data_request_txns":[{"body":{"inputs":[{"output_pointer":"0000000000000000000000000000000000000000000000000000000000000000:0"}],"outputs":[{"pkh":"wit1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwrt3a4","value":0,"time_lock":0}],"dr_output":{"data_request":{"time_lock":0,"retrieve":[{"kind":"HTTP-GET","url":"https://openweathermap.org/data/2.5/weather?id=2950159&appid=b6907d289e10d714a6e88b30761fae22"},{"kind":"HTTP-GET","url":"https://openweathermap.org/data/2.5/weather?id=2950159&appid=b6907d289e10d714a6e88b30761fae22"}],"aggregate":{"filters":[],"reducer":0},"tally":{"filters":[],"reducer":0}},"witness_reward":0,"witnesses":0,"commit_and_reveal_fee":0,"min_consensus_percentage":0,"collateral":0}},"signatures":[{"signature":{"Secp256k1":{"der":[]}},"public_key":{"compressed":0,"bytes":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}]}],"commit_txns":[],"reveal_txns":[],"tally_txns":[]}}}"#;
         assert_eq!(s, expected, "\n{}\n", s);
     }
 
@@ -1881,12 +1952,16 @@ mod tests {
             kind: RADType::HttpGet,
             url: "https://openweathermap.org/data/2.5/weather?id=2950159&appid=b6907d289e10d714a6e88b30761fae22".to_string(),
             script: vec![0],
+            body: vec![],
+            headers: vec![],
         };
 
         let rad_retrieve_2 = RADRetrieve {
             kind: RADType::HttpGet,
             url: "https://openweathermap.org/data/2.5/weather?id=2950159&appid=b6907d289e10d714a6e88b30761fae22".to_string(),
             script: vec![0],
+            body: vec![],
+            headers: vec![],
         };
 
         let rad_consensus = RADTally::default();

@@ -38,6 +38,15 @@ pub enum RadError {
         description
     )]
     JsonParse { description: String },
+    /// Failed to parse an object from a XML buffer
+    #[fail(
+        display = "Failed to parse an object from a XML buffer: {:?}",
+        description
+    )]
+    XmlParse { description: String },
+    /// Failed to parse an object from a XML buffer by depth overflow
+    #[fail(display = "Failed to parse an object from a XML buffer: XML depth overflow")]
+    XmlParseOverflow,
     /// The given index is not present in a RadonArray
     #[fail(display = "Failed to get item at index `{}` from RadonArray", index)]
     ArrayIndexOutOfBounds { index: i32 },
@@ -346,6 +355,16 @@ pub enum RadError {
     /// Invalid reveal serialization (malformed reveals are converted to this value)
     #[fail(display = "The reveal was not serialized correctly")]
     MalformedReveal,
+    /// Error while parsing HTTP header
+    #[fail(
+        display = "Invalid HTTP header: {}. name={:?}, value={:?}",
+        error, name, value
+    )]
+    InvalidHttpHeader {
+        name: String,
+        value: String,
+        error: String,
+    },
 }
 
 impl RadError {
@@ -512,7 +531,7 @@ impl RadError {
                     (Some(inner), None) => {
                         // Fix #1993 by emulating a bug from old versions of Rust (rust-lang/rust#83046)
                         if_rust_version::if_rust_version! { >= 1.53 {
-                            format!("inner: {:?}", inner).replace("'", "\\'")
+                            format!("inner: {:?}", inner).replace('\'', "\\'")
                         } else {
                             format!("inner: {:?}", inner)
                         }}

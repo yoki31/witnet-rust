@@ -109,6 +109,9 @@ impl Operable for RadonString {
             (RadonOpCodes::StringToUpperCase, None) => {
                 Ok(RadonTypes::from(string_operators::to_uppercase(self)))
             }
+            (RadonOpCodes::StringParseXMLMap, None) => string_operators::parse_xml_map(self)
+                .map(RadonTypes::from)
+                .map_err(Into::into),
             (op_code, args) => Err(RadError::UnsupportedOperator {
                 input_type: RADON_STRING_TYPE_NAME.to_string(),
                 operator: op_code.to_string(),

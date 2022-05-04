@@ -1,5 +1,6 @@
 use super::*;
 use witnet_data_structures::{chain::ChainState, mainnet_validations::TapiEngine};
+use witnet_storage::storage::WriteBatch;
 
 macro_rules! as_failure {
     ($e:expr) => {
@@ -36,7 +37,7 @@ fn check_chain_state_version(chain_state_bytes: &[u8]) -> Result<u32, ()> {
 // The input is assumed to be the serialization of a v0 ChainState
 fn migrate_chain_state_v0_to_v2(old_chain_state_bytes: &[u8]) -> Vec<u8> {
     let db_version: u32 = 2;
-    let db_version_bytes = db_version.to_be_bytes();
+    let db_version_bytes = db_version.to_le_bytes();
 
     // Extra fields in ChainState v2:
     let tapi = TapiEngine::default();
@@ -45,37 +46,50 @@ fn migrate_chain_state_v0_to_v2(old_chain_state_bytes: &[u8]) -> Vec<u8> {
     [&db_version_bytes, old_chain_state_bytes, &tapi_bytes].concat()
 }
 
-fn migrate_chain_state(bytes: &[u8]) -> Result<ChainState, failure::Error> {
-    match check_chain_state_version(bytes) {
-        Ok(0) => {
-            // Migrate from v0 to v2
-            let bytes = migrate_chain_state_v0_to_v2(bytes);
-            log::debug!("Successfully migrated ChainState v0 to v2");
+// This only needs to update the db_version field
+fn migrate_chain_state_v2_to_v3(chain_state_bytes: &mut [u8]) {
+    let db_version: u32 = 3;
+    let db_version_bytes = db_version.to_le_bytes();
+    chain_state_bytes[0..4].copy_from_slice(&db_version_bytes);
+}
 
-            // Latest version
-            // Skip the first 4 bytes because they are used to encode db_version
-            match deserialize(&bytes[4..]) {
-                Ok(v) => Ok(v),
-                Err(e) => Err(as_failure!(e)),
+fn migrate_chain_state(mut bytes: Vec<u8>) -> Result<ChainState, failure::Error> {
+    loop {
+        match check_chain_state_version(&bytes) {
+            Ok(0) => {
+                // Migrate from v0 to v2
+                bytes = migrate_chain_state_v0_to_v2(&bytes);
+                log::debug!("Successfully migrated ChainState v0 to v2");
             }
-        }
-        Ok(2) => {
-            // Latest version
-            // Skip the first 4 bytes because they are used to encode db_version
-            match deserialize(&bytes[4..]) {
-                Ok(v) => Ok(v),
-                Err(e) => Err(as_failure!(e)),
+            Ok(2) => {
+                // Migrate from v2 to v3
+                // Actually v2 and v3 have the same serialization, the difference is that in v2 the
+                // UTXOs are stored inside the ChainState, while in v3 that data structure is empty
+                // and the UTXOs are stored in separate keys. But that operation is done in the
+                // ChainManager on initialization, here we just update the db_version field.
+                migrate_chain_state_v2_to_v3(&mut bytes);
+                log::debug!("Successfully migrated ChainState v2 to v3");
             }
-        }
-        Ok(unknown_version) => Err(failure::format_err!(
-            "Error when reading ChainState from database: version {} not supported",
-            unknown_version
-        )),
-        Err(()) => {
-            // Error reading version (end of file?)
-            Err(failure::format_err!(
-                "Error when reading ChainState version from database: unexpected end of file"
-            ))
+            Ok(3) => {
+                // Latest version
+                // Skip the first 4 bytes because they are used to encode db_version
+                return match deserialize(&bytes[4..]) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(as_failure!(e)),
+                };
+            }
+            Ok(unknown_version) => {
+                return Err(failure::format_err!(
+                    "Error when reading ChainState from database: version {} not supported",
+                    unknown_version
+                ));
+            }
+            Err(()) => {
+                // Error reading version (end of file?)
+                return Err(failure::format_err!(
+                    "Error when reading ChainState version from database: unexpected end of file"
+                ));
+            }
         }
     }
 }
@@ -115,26 +129,23 @@ pub fn get_chain_state<K>(
 where
     K: serde::Serialize,
 {
-    get_versioned(key, |bytes| migrate_chain_state(&bytes))
+    get_versioned(key, migrate_chain_state)
 }
 
 /// Put a value associated to the key into the storage, preceded by a 4-byte version tag
-fn put_versioned<'a, 'b, K>(
-    key: &'a K,
-    value: &'b ChainState,
+fn put_versioned_to_batch<K>(
+    key: &K,
+    value: &ChainState,
     db_version: u32,
-) -> impl Future<Output = Result<(), failure::Error>> + 'static
+    batch: &mut WriteBatch,
+) -> Result<(), failure::Error>
 where
     K: serde::Serialize,
 {
-    let addr = StorageManagerAdapter::from_registry();
-
     let key_bytes = match serialize(key) {
         Ok(x) => x,
         Err(e) => {
-            return futures::future::Either::Left(futures::future::Either::Right(future::ready(
-                Err(e.into()),
-            )))
+            return Err(e.into());
         }
     };
 
@@ -142,29 +153,40 @@ where
     let value_bytes = match bincode::serialize_into(&mut buf, value) {
         Ok(()) => buf,
         Err(e) => {
-            return futures::future::Either::Left(futures::future::Either::Left(future::ready(
-                Err(e.into()),
-            )))
+            return Err(e.into());
         }
     };
 
-    futures::future::Either::Right(async move { addr.send(Put(key_bytes, value_bytes)).await? })
+    batch.put(key_bytes, value_bytes);
+
+    Ok(())
 }
 
-/// Put a value associated to the key into the storage
+/// Put a value associated to the key into the storage.
+/// The value will be atomically written along with the contents of the batch: either it will all
+/// succeed or it will all fail.
 // TODO: how to ensure that we don't accidentally persist the chain state using put instead of put_chain_state?
-pub fn put_chain_state<'a, 'b, K>(
+pub fn put_chain_state_in_batch<'a, 'b, K>(
     key: &'a K,
     chain_state: &'b ChainState,
+    mut batch: WriteBatch,
 ) -> impl Future<Output = Result<(), failure::Error>> + 'static
 where
     K: serde::Serialize + 'static,
 {
-    let db_version: u32 = 2;
+    let db_version: u32 = 3;
     // The first byte of the ChainState db_version must never be 0 or 1,
     // because that can be confused with version 0.
     assert!(db_version.to_le_bytes()[0] >= 2);
-    put_versioned(key, chain_state, db_version)
+
+    let res = put_versioned_to_batch(key, chain_state, db_version, &mut batch);
+
+    let addr = StorageManagerAdapter::from_registry();
+
+    async move {
+        res?;
+        addr.send(Batch(batch)).await?
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +306,16 @@ mod tests {
                 tapi: TapiEngine::default(),
             }
         );
+    }
+
+    #[test]
+    fn bincode_chainstate_migration_multiple_steps() {
+        // This test ensures that there are no accidental infinite loops in migrate_chain_state
+
+        // An empty ChainState v0 is 241 bytes
+        let chain_state_v0_bytes = vec![0; 241];
+        let migrated_chain_state = migrate_chain_state(chain_state_v0_bytes);
+        migrated_chain_state.unwrap();
     }
 
     #[test]

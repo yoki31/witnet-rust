@@ -19,7 +19,10 @@ use crate::{
 };
 use witnet_config::{config, config::Config};
 use witnet_data_structures::chain::ChainState;
-use witnet_storage::{backends, storage};
+use witnet_storage::{
+    backends,
+    storage::{self, Storage, WriteBatch},
+};
 
 pub use node_migrations::*;
 
@@ -149,8 +152,16 @@ where
     futures::future::Either::Right(fut)
 }
 
+/// Get an atomic reference to the storage backend
+pub fn get_backend() -> impl Future<Output = Result<Arc<dyn Storage + Send + Sync>, failure::Error>>
+{
+    let addr = StorageManagerAdapter::from_registry();
+
+    async move { addr.send(GetBackend).await? }
+}
+
 struct StorageManager {
-    backend: Box<dyn storage::Storage>,
+    backend: Arc<dyn Storage + Send + Sync>,
 }
 
 impl Drop for StorageManager {
@@ -167,7 +178,7 @@ impl Drop for StorageManager {
 impl Default for StorageManager {
     fn default() -> Self {
         StorageManager {
-            backend: Box::new(backends::nobackend::Backend),
+            backend: Arc::new(backends::nobackend::Backend),
         }
     }
 }
@@ -194,9 +205,6 @@ impl Handler<Configure> for StorageManager {
             "Configured {:#?} as the storage backend",
             storage_conf.backend
         );
-        if storage_conf.password.is_some() {
-            log::info!("Storage backend is using encryption");
-        }
 
         Ok(())
     }
@@ -262,32 +270,45 @@ impl Handler<Delete> for StorageManager {
     }
 }
 
-macro_rules! encrypted_backend {
-    ($backend:expr, $password_opt:expr) => {
-        if let Some(password) = $password_opt {
-            Box::new(backends::crypto::Backend::new(password, $backend))
-                as Box<dyn storage::Storage>
-        } else {
-            Box::new($backend) as Box<dyn storage::Storage>
-        }
-    };
+struct Batch(WriteBatch);
+
+impl Message for Batch {
+    type Result = Result<(), failure::Error>;
 }
 
-fn create_appropriate_backend(
-    conf: &config::Storage,
-) -> Result<Box<dyn storage::Storage>, failure::Error> {
-    let passwd = conf.password.clone();
+impl Handler<Batch> for StorageManager {
+    type Result = <Batch as Message>::Result;
 
+    fn handle(&mut self, msg: Batch, _ctx: &mut Self::Context) -> Self::Result {
+        self.backend.write(msg.0)
+    }
+}
+
+struct GetBackend;
+
+impl Message for GetBackend {
+    type Result = Result<Arc<dyn Storage + Send + Sync>, failure::Error>;
+}
+
+impl Handler<GetBackend> for StorageManager {
+    type Result = <GetBackend as Message>::Result;
+
+    fn handle(&mut self, _msg: GetBackend, _ctx: &mut Self::Context) -> Self::Result {
+        Ok(self.backend.clone())
+    }
+}
+
+/// Create storage backend according to provided config
+pub fn create_appropriate_backend(
+    conf: &config::Storage,
+) -> Result<Arc<dyn storage::Storage + Send + Sync>, failure::Error> {
     match conf.backend {
-        config::StorageBackend::HashMap => Ok(encrypted_backend!(
-            backends::hashmap::Backend::new(),
-            passwd
-        )),
+        config::StorageBackend::HashMap => Ok(Arc::new(backends::hashmap::Backend::default())),
         config::StorageBackend::RocksDB => {
             let path = conf.db_path.as_path();
 
             backends::rocksdb::Backend::open_default(path)
-                .map(|backend| encrypted_backend!(backend, passwd))
+                .map(|backend| -> Arc<dyn storage::Storage + Send + Sync> { Arc::new(backend) })
                 .map_err(|e| as_failure!(e))
         }
     }

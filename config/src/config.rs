@@ -52,7 +52,7 @@ use partial_struct::PartialStruct;
 use std::convert::TryFrom;
 use witnet_crypto::hash::HashFunction;
 use witnet_data_structures::chain::{ConsensusConstants, Environment, PartialConsensusConstants};
-use witnet_protected::{Protected, ProtectedString};
+use witnet_protected::ProtectedString;
 
 /// The total configuration object that contains all other, more
 /// specific, configuration objects (connections, storage, etc).
@@ -276,15 +276,6 @@ pub struct Storage {
     #[partial_struct(skip)]
     #[partial_struct(serde(default))]
     pub backend: StorageBackend,
-    /// Whether or not the information should be encrypted before
-    /// being stored with this password
-    #[partial_struct(skip)]
-    #[partial_struct(serde(default))]
-    #[partial_struct(serde(
-        serialize_with = "to_protected_string",
-        deserialize_with = "as_protected_string"
-    ))]
-    pub password: Option<Protected>,
     /// Path to the directory that will contain the database. Used
     /// only if backend is RocksDB.
     pub db_path: PathBuf,
@@ -380,12 +371,10 @@ pub struct Mempool {
 #[derive(Deserialize, Serialize, Default, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Tapi {
-    /// Oppose WIP0017
-    pub oppose_wip0017: bool,
-    /// Oppose WIP0018
-    pub oppose_wip0018: bool,
-    /// Oppose WIP0019
-    pub oppose_wip0019: bool,
+    /// Oppose WIP0020
+    pub oppose_wip0020: bool,
+    /// Oppose WIP0021
+    pub oppose_wip0021: bool,
 }
 
 fn to_partial_consensus_constants(c: &ConsensusConstants) -> PartialConsensusConstants {
@@ -709,7 +698,6 @@ impl Storage {
     pub fn from_partial(config: &PartialStorage, defaults: &dyn Defaults) -> Self {
         Storage {
             backend: config.backend.clone(),
-            password: config.password.clone(),
             db_path: config
                 .db_path
                 .to_owned()
@@ -721,8 +709,6 @@ impl Storage {
     pub fn to_partial(&self) -> PartialStorage {
         PartialStorage {
             backend: self.backend.clone(),
-            // password should not be exported
-            password: None,
             db_path: Some(self.db_path.clone()),
             master_key_import_path: self.master_key_import_path.clone(),
         }
@@ -1135,24 +1121,6 @@ where
     })
 }
 
-fn to_protected_string<S>(val: &Option<Protected>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match val {
-        Some(_) => serializer.serialize_str("**** REDACTED ****"),
-        None => serializer.serialize_none(),
-    }
-}
-
-fn as_protected_string<'de, D>(deserializer: D) -> Result<Option<Protected>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let passwd = String::deserialize(deserializer)?;
-    Ok(Some(passwd.into()))
-}
-
 // https://stackoverflow.com/a/43627388
 fn deserialize_one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
@@ -1201,7 +1169,6 @@ mod tests {
     fn test_storage_from_partial() {
         let partial_config = PartialStorage {
             backend: StorageBackend::RocksDB,
-            password: None, // password should not be exported
             db_path: Some(PathBuf::from("other")),
             master_key_import_path: None,
         };

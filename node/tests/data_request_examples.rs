@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use witnet_data_structures::{chain::DataRequestOutput, mainnet_validations::current_active_wips};
+use witnet_data_structures::{chain::DataRequestOutput, mainnet_validations::all_wips_active};
 use witnet_node::actors::messages::BuildDrt;
 use witnet_rad::{
     script::RadonScriptExecutionSettings,
@@ -51,7 +51,7 @@ fn run_dr_locally_with_data(
     // Validate RADON: if the dr cannot be included in a witnet block, this should fail.
     // This does not validate other data request parameters such as number of witnesses, weight, or
     // collateral, so it is still possible that this request is considered invalid by miners.
-    validate_rad_request(&dr.data_request, &current_active_wips())?;
+    validate_rad_request(&dr.data_request, &all_wips_active())?;
 
     let mut retrieval_results = vec![];
     assert_eq!(dr.data_request.retrieve.len(), data.len());
@@ -61,7 +61,7 @@ fn run_dr_locally_with_data(
             r,
             *d,
             RadonScriptExecutionSettings::disable_all(),
-            current_active_wips(),
+            all_wips_active(),
         )?);
     }
 
@@ -69,7 +69,7 @@ fn run_dr_locally_with_data(
     let aggregation_result = witnet_rad::run_aggregation(
         retrieval_results,
         &dr.data_request.aggregate,
-        current_active_wips(),
+        all_wips_active(),
     )?;
     log::info!("Aggregation result: {:?}", aggregation_result);
 
@@ -80,11 +80,8 @@ fn run_dr_locally_with_data(
             .map(RadonTypes::try_from)
             .collect();
     log::info!("Running tally with values {:?}", reported_values);
-    let tally_result = witnet_rad::run_tally(
-        reported_values?,
-        &dr.data_request.tally,
-        current_active_wips(),
-    )?;
+    let tally_result =
+        witnet_rad::run_tally(reported_values?, &dr.data_request.tally, all_wips_active())?;
     log::info!("Tally result: {:?}", tally_result);
 
     Ok(tally_result)
@@ -150,8 +147,9 @@ fn existing_examples() -> HashMap<&'static str, (BuildDrt, &'static [&'static st
             &[
                 r#"{"last":"89264.27"}"#,
                 r#"{"bpi":{"USD":{"rate_float":89279.0567}}}"#,
+                r#"{"data":{"markets":[{"ticker": {"lastPrice": "89261.012"}}]}}"#,
             ],
-            RadonTypes::Float(RadonFloat::from(89271.66335)),
+            RadonTypes::Float(RadonFloat::from(89268.11290000001)),
         ),
         (
             "error_301_source.json",
@@ -172,6 +170,7 @@ fn existing_examples() -> HashMap<&'static str, (BuildDrt, &'static [&'static st
                 r#"0000000000000000000e3b5418f6c92cb19494dfea28a83da8643485925aba1b"#,
                 r#"{"hash":"0000000000000000000e3b5418f6c92cb19494dfea28a83da8643485925aba1b"}"#,
                 r#"{"data":{"best_block_hash":"0000000000000000000e3b5418f6c92cb19494dfea28a83da8643485925aba1b"}}"#,
+                r#"{"data":{"bitcoin":{"blocks": [{"blockHash": "0000000000000000000e3b5418f6c92cb19494dfea28a83da8643485925aba1b"}]}}}"#,
             ],
             RadonTypes::String(RadonString::from(
                 "0000000000000000000e3b5418f6c92cb19494dfea28a83da8643485925aba1b",
@@ -185,6 +184,46 @@ fn existing_examples() -> HashMap<&'static str, (BuildDrt, &'static [&'static st
                 37, 243, 87, 33, 196, 171, 163, 135, 8, 21, 38, 67, 130, 180, 217, 50, 108, 156,
                 143, 166, 82, 161, 221, 100, 98, 226, 10, 230, 226, 213, 143, 190,
             ])),
+        ),
+        (
+            "mojitoswap.json",
+            examples::mojitoswap(),
+            &[
+                r#"{"data":{"bundles":[{"__typename":"Bundle","ethPrice":"23.2510022494185052280717086560108","id":"1"}]}}"#,
+            ],
+            RadonTypes::Float(RadonFloat::from(23.251002249418505)),
+        ),
+        (
+            "xml_source.json",
+            examples::xml_source(),
+            &[
+                r#"{"image_data":"<svg xmlns='http://www.w3.org/2000/svg'><path fill='#ea2'/><path fill='#fe2'/></svg>"}"#,
+            ],
+            RadonTypes::String(RadonString::from("#ea2")),
+        ),
+        (
+            "xml_source2.json",
+            examples::xml_source2(),
+            &[r#"<?xml version="1.0" encoding="ISO-8859-1"?>
+                    <dwml version="1.0" xmlns:xsd="https://www.w3.org/2001/XMLSchema" xmlns:xsi="https://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://graphical.weather.gov/xml/DWMLgen/schema/DWML.xsd">
+                        <data type="forecast">
+                            <parameters applicable-location="point1">
+                                <weather time-layout="k-p12h-n13-1">
+                                    <name>Weather Type, Coverage, Intensity</name>
+                                    <weather-conditions weather-summary="Partly Sunny then Chance Rain/Snow"/>
+                                    <weather-conditions weather-summary="Snow Likely and Blustery"/>
+                                    <weather-conditions weather-summary="Snow Likely"/>
+                                </weather>
+                            </parameters>
+                        </data>
+                        <data type="current observations">
+	                        <location>
+		                        <location-key>point1</location-key>
+		                        <point latitude="39.9" longitude="-105.1"/>
+	                        </location>
+	                    </data>
+	                </dwml>">"#],
+            RadonTypes::String(RadonString::from("Snow Likely")),
         ),
     ];
 
@@ -230,6 +269,41 @@ mod examples {
         ]))
         .unwrap();
 
+        let url_2 = "https://api.blocktap.io/graphql";
+        let r2_script = cbor_to_vec(&Value::Array(vec![
+            Value::Integer(RadonOpCodes::StringParseJSONMap as i128),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text("data".to_string()),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetArray as i128),
+                Value::Text("markets".to_string()),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::ArrayGetMap as i128),
+                Value::Integer(0),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text("ticker".to_string()),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetString as i128),
+                Value::Text("lastPrice".to_string()),
+            ]),
+            Value::Integer(RadonOpCodes::StringAsFloat as i128),
+        ]))
+        .unwrap();
+        let r2_body = Vec::from(String::from(
+            r#"{"query":"query price {\n  markets(filter:{ baseSymbol: {_eq:\"BTC\"} quoteSymbol: {_in:[\"USD\",\"USDT\"]} marketStatus: { _eq: Active }}) {\n    marketSymbol\n    ticker {\n      lastPrice\n    }\n  }\n}","variables":null,"operationName":"price"}"#,
+        ));
+        let r2_headers = vec![("Content-Type", "application/json")];
+        let r2_headers = r2_headers
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+
         BuildDrt {
             dro: DataRequestOutput {
                 data_request: RADRequest {
@@ -239,11 +313,22 @@ mod examples {
                             kind: RADType::HttpGet,
                             url: url_0.to_string(),
                             script: r0_script,
+                            body: vec![],
+                            headers: vec![],
                         },
                         RADRetrieve {
                             kind: RADType::HttpGet,
                             url: url_1.to_string(),
                             script: r1_script,
+                            body: vec![],
+                            headers: vec![],
+                        },
+                        RADRetrieve {
+                            kind: RADType::HttpPost,
+                            url: url_2.to_string(),
+                            script: r2_script,
+                            body: r2_body,
+                            headers: r2_headers,
                         },
                     ],
                     aggregate: RADAggregate {
@@ -297,6 +382,8 @@ mod examples {
                         kind: RADType::HttpGet,
                         url: url_0.to_string(),
                         script: r0_script,
+                        body: vec![],
+                        headers: vec![],
                     }],
                     aggregate: RADAggregate {
                         filters: vec![],
@@ -344,6 +431,8 @@ mod examples {
                         kind: RADType::HttpGet,
                         url: url_0.to_string(),
                         script: r0_script,
+                        body: vec![],
+                        headers: vec![],
                     }],
                     aggregate: RADAggregate {
                         filters: vec![],
@@ -392,6 +481,46 @@ mod examples {
         ]))
         .unwrap();
 
+        let url_3 = "https://graphql.bitquery.io/";
+        let r3_script = cbor_to_vec(&Value::Array(vec![
+            Value::Integer(RadonOpCodes::StringParseJSONMap as i128),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text("data".to_string()),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text("bitcoin".to_string()),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetArray as i128),
+                Value::Text("blocks".to_string()),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::ArrayGetMap as i128),
+                Value::Integer(0),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetString as i128),
+                Value::Text("blockHash".to_string()),
+            ]),
+        ]))
+        .unwrap();
+        let r3_body = Vec::from(String::from(
+            r#"{"query":"query{\nbitcoin {\nblocks(options: {limit: 1, desc: \"height\"}) {\nheight\nblockHash\n}\n}\n}","variables":null}"#,
+        ));
+        // Many headers are needed
+        let r3_headers = vec![
+            ("Accept", "*/*"),
+            ("Referer", "https://bitquery.io/"),
+            ("Content-Type", "application/json"),
+            ("Origin", "https://bitquery.io"),
+        ];
+        let r3_headers = r3_headers
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+
         BuildDrt {
             dro: DataRequestOutput {
                 data_request: RADRequest {
@@ -401,16 +530,29 @@ mod examples {
                             kind: RADType::HttpGet,
                             url: url_0.to_string(),
                             script: r0_script,
+                            body: vec![],
+                            headers: vec![],
                         },
                         RADRetrieve {
                             kind: RADType::HttpGet,
                             url: url_1.to_string(),
                             script: r1_script,
+                            body: vec![],
+                            headers: vec![],
                         },
                         RADRetrieve {
                             kind: RADType::HttpGet,
                             url: url_2.to_string(),
                             script: r2_script,
+                            body: vec![],
+                            headers: vec![],
+                        },
+                        RADRetrieve {
+                            kind: RADType::HttpPost,
+                            url: url_3.to_string(),
+                            script: r3_script,
+                            body: r3_body,
+                            headers: r3_headers,
                         },
                     ],
                     aggregate: RADAggregate {
@@ -447,6 +589,8 @@ mod examples {
                         kind: RADType::Rng,
                         url: url_0.to_string(),
                         script: r0_script,
+                        body: vec![],
+                        headers: vec![],
                     }],
                     aggregate: RADAggregate {
                         filters: vec![],
@@ -464,6 +608,201 @@ mod examples {
                 collateral: 1_000_000_000,
             },
             fee: 0,
+        }
+    }
+
+    pub fn mojitoswap() -> BuildDrt {
+        let url_0 = "https://thegraph.kcc.network/subgraphs/name/mojito/swap";
+        let r0_script = cbor_to_vec(&Value::Array(vec![
+            Value::Integer(RadonOpCodes::StringParseJSONMap as i128),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text("data".to_string()),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetArray as i128),
+                Value::Text("bundles".to_string()),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::ArrayGetMap as i128),
+                Value::Integer(0),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetString as i128),
+                Value::Text("ethPrice".to_string()),
+            ]),
+            Value::Integer(RadonOpCodes::StringAsFloat as i128),
+        ]))
+        .unwrap();
+        let r0_body = Vec::from(String::from(
+            r#"{"operationName":"bundles","variables":{},"query":"query bundles {\n  bundles(where: {id: 1}) {\n    id\n    ethPrice\n    __typename\n  }\n}\n"}"#,
+        ));
+        let r0_headers = vec![("Content-Type", "application/json")];
+        let r0_headers = r0_headers
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+
+        BuildDrt {
+            dro: DataRequestOutput {
+                data_request: RADRequest {
+                    time_lock: 0,
+                    retrieve: vec![RADRetrieve {
+                        kind: RADType::HttpPost,
+                        url: url_0.to_string(),
+                        script: r0_script,
+                        body: r0_body,
+                        headers: r0_headers,
+                    }],
+                    aggregate: RADAggregate {
+                        filters: vec![],
+                        reducer: RadonReducers::AverageMean as u32,
+                    },
+                    tally: RADTally {
+                        filters: vec![],
+                        reducer: RadonReducers::AverageMean as u32,
+                    },
+                },
+                witness_reward: 1000,
+                witnesses: 3,
+                commit_and_reveal_fee: 10,
+                min_consensus_percentage: 51,
+                collateral: 1_000_000_000,
+            },
+            fee: 0,
+        }
+    }
+
+    pub fn xml_source() -> BuildDrt {
+        let url_0 = "https://api-liscon21.wittycreatures.com/metadata/1";
+        let r0_script = cbor_to_vec(&Value::Array(vec![
+            Value::Integer(RadonOpCodes::StringParseJSONMap as i128),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetString as i128),
+                Value::Text(String::from("image_data")),
+            ]),
+            Value::Integer(RadonOpCodes::StringParseXMLMap as i128),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text(String::from("svg")),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetArray as i128),
+                Value::Text(String::from("path")),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::ArrayGetMap as i128),
+                Value::Integer(0),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetString as i128),
+                Value::Text(String::from("@fill")),
+            ]),
+        ]))
+        .unwrap();
+
+        BuildDrt {
+            dro: DataRequestOutput {
+                data_request: RADRequest {
+                    time_lock: 0,
+                    retrieve: vec![RADRetrieve {
+                        kind: RADType::HttpGet,
+                        url: url_0.to_string(),
+                        script: r0_script,
+                        body: vec![],
+                        headers: vec![],
+                    }],
+                    aggregate: RADAggregate {
+                        filters: vec![],
+                        reducer: RadonReducers::Mode as u32,
+                    },
+                    tally: RADTally {
+                        filters: vec![RADFilter {
+                            op: RadonFilters::Mode as u32,
+                            args: vec![],
+                        }],
+                        reducer: RadonReducers::Mode as u32,
+                    },
+                },
+                witness_reward: 1000,
+                witnesses: 3,
+                commit_and_reveal_fee: 10,
+                min_consensus_percentage: 51,
+                collateral: 1_000_000_000,
+            },
+            fee: 0,
+        }
+    }
+
+    pub fn xml_source2() -> BuildDrt {
+        let url_0 = "https://forecast.weather.gov/MapClick.php?lat=39.75&lon=-104.99&unit=0&lg=english&FcstType=dwml";
+        let r0_script = cbor_to_vec(&Value::Array(vec![
+            Value::Integer(RadonOpCodes::StringParseXMLMap as i128),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text(String::from("dwml")),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetArray as i128),
+                Value::Text(String::from("data")),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::ArrayGetMap as i128),
+                Value::Integer(0),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text(String::from("parameters")),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetMap as i128),
+                Value::Text(String::from("weather")),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetArray as i128),
+                Value::Text(String::from("weather-conditions")),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::ArrayGetMap as i128),
+                Value::Integer(2),
+            ]),
+            Value::Array(vec![
+                Value::Integer(RadonOpCodes::MapGetString as i128),
+                Value::Text(String::from("@weather-summary")),
+            ]),
+        ]))
+        .unwrap();
+
+        BuildDrt {
+            dro: DataRequestOutput {
+                data_request: RADRequest {
+                    time_lock: 0,
+                    retrieve: vec![RADRetrieve {
+                        kind: RADType::HttpGet,
+                        url: url_0.to_string(),
+                        script: r0_script,
+                        body: vec![],
+                        headers: vec![],
+                    }],
+                    aggregate: RADAggregate {
+                        filters: vec![],
+                        reducer: RadonReducers::Mode as u32,
+                    },
+                    tally: RADTally {
+                        filters: vec![RADFilter {
+                            op: RadonFilters::Mode as u32,
+                            args: vec![],
+                        }],
+                        reducer: RadonReducers::Mode as u32,
+                    },
+                },
+                witness_reward: 1000,
+                witnesses: 3,
+                commit_and_reveal_fee: 10,
+                min_consensus_percentage: 51,
+                collateral: 1_000_000_000,
+            },
+            fee: 1000,
         }
     }
 }

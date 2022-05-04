@@ -4,8 +4,22 @@ use futures::{executor::block_on, future::join_all};
 use serde::Serialize;
 pub use serde_cbor::to_vec as cbor_to_vec;
 pub use serde_cbor::Value as CborValue;
+use std::str::FromStr;
+use surf::{
+    http::headers::{HeaderName, HeaderValues, ToHeaderValues},
+    RequestBuilder,
+};
+
+#[cfg(test)]
+use witnet_data_structures::mainnet_validations::all_wips_active;
+use witnet_data_structures::{
+    chain::{RADAggregate, RADRequest, RADRetrieve, RADTally, RADType},
+    mainnet_validations::{current_active_wips, ActiveWips},
+    radon_report::{RadonReport, ReportContext, RetrievalMetadata, Stage, TallyMetaData},
+};
 
 use crate::{
+    conditions::{evaluate_tally_precondition_clause, TallyPreconditionClauseResult},
     error::RadError,
     script::{
         create_radon_script_from_filters_and_reducer, execute_radon_script, unpack_radon_script,
@@ -14,12 +28,8 @@ use crate::{
     types::{array::RadonArray, bytes::RadonBytes, string::RadonString, RadonTypes},
     user_agents::UserAgent,
 };
-use witnet_data_structures::{
-    chain::{RADAggregate, RADRequest, RADRetrieve, RADTally, RADType},
-    mainnet_validations::{current_active_wips, ActiveWips},
-    radon_report::{RadonReport, ReportContext, RetrievalMetadata, Stage, TallyMetaData},
-};
 
+pub mod conditions;
 pub mod error;
 pub mod filters;
 pub mod hash_functions;
@@ -51,6 +61,10 @@ pub fn try_data_request(
     settings: RadonScriptExecutionSettings,
     inputs_injection: Option<&[&str]>,
 ) -> RADRequestExecutionReport {
+    #[cfg(not(test))]
+    let active_wips = current_active_wips();
+    #[cfg(test)]
+    let active_wips = all_wips_active();
     let mut retrieval_context =
         ReportContext::from_stage(Stage::Retrieval(RetrievalMetadata::default()));
     let retrieve_responses = if let Some(inputs) = inputs_injection {
@@ -69,7 +83,7 @@ pub fn try_data_request(
             request
                 .retrieve
                 .iter()
-                .map(|retrieve| run_retrieval_report(retrieve, settings, current_active_wips()))
+                .map(|retrieve| run_retrieval_report(retrieve, settings, active_wips.clone()))
                 .collect::<Vec<_>>(),
         ))
     };
@@ -81,19 +95,40 @@ pub fn try_data_request(
                 .unwrap_or_else(|error| RadonReport::from_result(Err(error), &retrieval_context))
         })
         .collect();
-    let retrieval_values: Vec<RadonTypes> = retrieval_reports
-        .iter()
-        .map(|report| report.result.clone())
-        .collect();
 
-    let (aggregation_result, aggregation_context) = run_aggregation_report(
-        retrieval_values,
-        &request.aggregate,
-        settings,
-        current_active_wips(),
+    // Evaluate aggregation pre-condition by using the same logic than for tally pre-condition,
+    // to ensure that at least 20% of the data sources are not errors.
+    // Aggregation stage does not need to evaluate any post-condition.
+    let clause_result = evaluate_tally_precondition_clause(
+        retrieval_reports.clone(),
+        0.2,
+        1,
+        &current_active_wips(),
     );
-    let aggregation_report = aggregation_result
-        .unwrap_or_else(|error| RadonReport::from_result(Err(error), &aggregation_context));
+
+    let aggregation_report = match clause_result {
+        Ok(TallyPreconditionClauseResult::MajorityOfValues {
+            values,
+            liars: _liars,
+            errors: _errors,
+        }) => {
+            // Perform aggregation on the values that made it to the output vector after applying the
+            // source scripts (aka _normalization scripts_ in the original whitepaper) and filtering out
+            // failures.
+            let (aggregation_result, aggregation_context) =
+                run_aggregation_report(values, &request.aggregate, settings, active_wips.clone());
+
+            aggregation_result
+                .unwrap_or_else(|error| RadonReport::from_result(Err(error), &aggregation_context))
+        }
+        Ok(TallyPreconditionClauseResult::MajorityOfErrors { errors_mode }) => {
+            RadonReport::from_result(
+                Ok(RadonTypes::RadonError(errors_mode)),
+                &ReportContext::default(),
+            )
+        }
+        Err(e) => RadonReport::from_result(Err(e), &ReportContext::default()),
+    };
     let aggregation_value = aggregation_report.result.clone();
 
     let (tally_result, tally_context) = run_tally_report(
@@ -102,7 +137,7 @@ pub fn try_data_request(
         None,
         None,
         settings,
-        current_active_wips(),
+        active_wips,
     );
     let tally_report =
         tally_result.unwrap_or_else(|error| RadonReport::from_result(Err(error), &tally_context));
@@ -114,8 +149,8 @@ pub fn try_data_request(
     }
 }
 
-/// Handle HTTP-GET response with data report
-fn http_get_response_with_data_report(
+/// Handle HTTP-GET and HTTP-POST response with data, and return a `RadonReport`.
+fn string_response_with_data_report(
     retrieve: &RADRetrieve,
     response: &str,
     context: &mut ReportContext<RadonTypes>,
@@ -145,15 +180,13 @@ pub fn run_retrieval_with_data_report(
     context: &mut ReportContext<RadonTypes>,
     settings: RadonScriptExecutionSettings,
 ) -> Result<RadonReport<RadonTypes>> {
-    match &context.active_wips {
-        Some(active_wips) if active_wips.wip0019() => match retrieve.kind {
-            RADType::Unknown => Err(RadError::UnknownRetrieval),
-            RADType::HttpGet => {
-                http_get_response_with_data_report(retrieve, response, context, settings)
-            }
-            RADType::Rng => rng_response_with_data_report(response, context),
-        },
-        _ => http_get_response_with_data_report(retrieve, response, context, settings),
+    match retrieve.kind {
+        RADType::HttpGet => string_response_with_data_report(retrieve, response, context, settings),
+        RADType::Rng => rng_response_with_data_report(response, context),
+        RADType::HttpPost => {
+            string_response_with_data_report(retrieve, response, context, settings)
+        }
+        _ => Err(RadError::UnknownRetrieval),
     }
 }
 
@@ -170,26 +203,35 @@ pub fn run_retrieval_with_data(
         .map(RadonReport::into_inner)
 }
 
-/// Handle HTTP-GET response
-async fn http_get_response(
+/// Handle generic HTTP (GET/POST) response
+async fn http_response(
     retrieve: &RADRetrieve,
     context: &mut ReportContext<RadonTypes>,
     settings: RadonScriptExecutionSettings,
 ) -> Result<RadonReport<RadonTypes>> {
     // Validate URL because surf::get panics on invalid URL
     // It could still panic if surf gets updated and changes their URL parsing library
+    // TODO: this could be removed if we use `surf::RequestBuilder::new(Method::Get, url)` instead of `surf::get(url)`
     let _valid_url = url::Url::parse(&retrieve.url).map_err(|err| RadError::UrlParseError {
         inner: err,
         url: retrieve.url.clone(),
     })?;
 
-    // Set a random user-agent from the list
-    let mut response = surf::get(&retrieve.url)
-        .set_header("User-Agent", UserAgent::random())
-        .await
-        .map_err(|x| RadError::HttpOther {
-            message: x.to_string(),
-        })?;
+    let request = match retrieve.kind {
+        RADType::HttpGet => surf::get(&retrieve.url),
+        RADType::HttpPost => {
+            // The call to `.body` sets the content type header to `application/octet-stream`
+            surf::post(&retrieve.url).body(retrieve.body.clone())
+        }
+        _ => panic!(
+            "Called http_response with invalid retrieval kind {:?}",
+            retrieve.kind
+        ),
+    };
+    let request = add_http_headers(request, retrieve, context)?;
+    let mut response = request.await.map_err(|x| RadError::HttpOther {
+        message: x.to_string(),
+    })?;
 
     if !response.status().is_success() {
         return Err(RadError::HttpStatus {
@@ -242,25 +284,81 @@ async fn rng_response(
     Ok(RadonReport::from_result(Ok(random_bytes), context))
 }
 
+/// Add HTTP headers from `retrieve.headers` to surf request.
+///
+/// Some notes:
+///
+/// * Overwriting the User-Agent header is allowed.
+/// * Multiple headers with the same key but different value are not supported, the current
+///   implementation will only use the last header.
+/// * All the non-standard headers will be converted to lowercase. Standard headers will use their
+///   standard capitalization, for example: `Content-Type`.
+/// * The HTTP client may reorder the headers: the order can change between consecutive invocations
+///   of the same request
+fn add_http_headers(
+    mut request: RequestBuilder,
+    retrieve: &RADRetrieve,
+    _context: &mut ReportContext<RadonTypes>,
+) -> Result<RequestBuilder> {
+    // Add random user agent
+    request = request.header("User-Agent", UserAgent::random());
+
+    // Add extra_headers from retrieve.headers
+    for (name, value) in &retrieve.headers {
+        // Additional validation because surf does not validate some cases such as:
+        // * header name that contains `:`
+        // * header value that contains `\n`
+        let _name = http::header::HeaderName::from_str(name.as_str()).map_err(|e| {
+            RadError::InvalidHttpHeader {
+                name: name.to_string(),
+                value: value.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+        let _value = http::header::HeaderValue::from_str(value.as_str()).map_err(|e| {
+            RadError::InvalidHttpHeader {
+                name: name.to_string(),
+                value: value.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+
+        // Validate headers using surf to avoid panics
+        let name: HeaderName =
+            HeaderName::from_str(name).map_err(|e| RadError::InvalidHttpHeader {
+                name: name.to_string(),
+                value: value.to_string(),
+                error: e.to_string(),
+            })?;
+        let values: HeaderValues = value
+            .to_header_values()
+            .map_err(|e| RadError::InvalidHttpHeader {
+                name: name.to_string(),
+                value: value.to_string(),
+                error: e.to_string(),
+            })?
+            .collect();
+
+        request = request.header(name, &values);
+    }
+
+    Ok(request)
+}
+
 /// Run retrieval stage of a data request, return `Result<RadonReport>`.
 pub async fn run_retrieval_report(
     retrieve: &RADRetrieve,
     settings: RadonScriptExecutionSettings,
     active_wips: ActiveWips,
 ) -> Result<RadonReport<RadonTypes>> {
-    let wip_0019_active = active_wips.wip0019();
-
     let context = &mut ReportContext::from_stage(Stage::Retrieval(RetrievalMetadata::default()));
     context.set_active_wips(active_wips);
 
-    if wip_0019_active {
-        match retrieve.kind {
-            RADType::Unknown => Err(RadError::UnknownRetrieval),
-            RADType::HttpGet => http_get_response(retrieve, context, settings).await,
-            RADType::Rng => rng_response(context, settings).await,
-        }
-    } else {
-        http_get_response(retrieve, context, settings).await
+    match retrieve.kind {
+        RADType::HttpGet => http_response(retrieve, context, settings).await,
+        RADType::Rng => rng_response(context, settings).await,
+        RADType::HttpPost => http_response(retrieve, context, settings).await,
+        _ => Err(RadError::UnknownRetrieval),
     }
 }
 
@@ -451,6 +549,8 @@ mod tests {
             kind: RADType::HttpGet,
             url: "https://openweathermap.org/data/2.5/weather?id=2950159&appid=b6907d289e10d714a6e88b30761fae22".to_string(),
             script: packed_script_r,
+            body: vec![],
+            headers: vec![],
         };
         let response = r#"{"coord":{"lon":13.41,"lat":52.52},"weather":[{"id":500,"main":"Rain","description":"light rain","icon":"10d"}],"base":"stations","main":{"temp":17.59,"pressure":1022,"humidity":67,"temp_min":15,"temp_max":20},"visibility":10000,"wind":{"speed":3.6,"deg":260},"rain":{"1h":0.51},"clouds":{"all":20},"dt":1567501321,"sys":{"type":1,"id":1275,"message":0.0089,"country":"DE","sunrise":1567484402,"sunset":1567533129},"timezone":7200,"id":2950159,"name":"Berlin","cod":200}"#;
 
@@ -508,6 +608,8 @@ mod tests {
             kind: RADType::HttpGet,
             url: "https://wrapapi.com/use/aesedepece/ffzz/prima/0.0.3?wrapAPIKey=ql4DVWylABdXCpt1NUTLNEDwPH57aHGm".to_string(),
             script: packed_script_r,
+            body: vec![],
+            headers: vec![],
         };
         let response = "84";
         let expected = RadonTypes::Float(RadonFloat::from(84));
@@ -544,6 +646,8 @@ mod tests {
             kind: RADType::HttpGet,
             url: "https://wrapapi.com/use/aesedepece/ffzz/murders/0.0.2?wrapAPIKey=ql4DVWylABdXCpt1NUTLNEDwPH57aHGm".to_string(),
             script: packed_script_r,
+            body: vec![],
+            headers: vec![],
         };
         let response = "307";
         let expected = RadonTypes::Float(RadonFloat::from(307));
@@ -594,6 +698,8 @@ mod tests {
             kind: RADType::HttpGet,
             url: "http://airemadrid.herokuapp.com/api/estacion".to_string(),
             script: packed_script_r,
+            body: vec![],
+            headers: vec![],
         };
         // This response was modified because the original was about 100KB.
         let response = r#"[{"estacion_nombre":"Pza. de España","estacion_numero":4,"fecha":"03092019","hora0":{"estado":"Pasado","valor":"00008"}}]"#;
@@ -637,6 +743,8 @@ mod tests {
             kind: RADType::HttpGet,
             url: "https://wrapapi.com/use/aesedepece/ffzz/generales/0.0.3?wrapAPIKey=ql4DVWylABdXCpt1NUTLNEDwPH57aHGm".to_string(),
             script: packed_script_r,
+            body: vec![],
+            headers: vec![],
         };
         let response = r#"{"PSOE":123,"PP":66,"Cs":57,"UP":42,"VOX":24,"ERC-SOBIRANISTES":15,"JxCAT-JUNTS":7,"PNV":6,"EH Bildu":4,"CCa-PNC":2,"NA+":2,"COMPROMÍS 2019":1,"PRC":1,"PACMA":0,"FRONT REPUBLICÀ":0,"BNG":0,"RECORTES CERO-GV":0,"NCa":0,"PACT":0,"ARA-MES-ESQUERRA":0,"GBAI":0,"PUM+J":0,"EN MAREA":0,"PCTE":0,"EL PI":0,"AxSI":0,"PCOE":0,"PCPE":0,"AVANT ADELANTE LOS VERDES":0,"EB":0,"CpM":0,"SOMOS REGIÓN":0,"PCPA":0,"PH":0,"UIG-SOM-CUIDES":0,"ERPV":0,"IZQP":0,"PCPC":0,"AHORA CANARIAS":0,"CxG":0,"PPSO":0,"CNV":0,"PREPAL":0,"C.Ex-C.R.Ex-P.R.Ex":0,"PR+":0,"P-LIB":0,"CILU-LINARES":0,"ANDECHA ASTUR":0,"JF":0,"PYLN":0,"FIA":0,"FE de las JONS":0,"SOLIDARIA":0,"F8":0,"DPL":0,"UNIÓN REGIONALISTA":0,"centrados":0,"DP":0,"VOU":0,"PDSJE-UDEC":0,"IZAR":0,"RISA":0,"C 21":0,"+MAS+":0,"UDT":0}"#;
         let expected = RadonTypes::Float(RadonFloat::from(123));
@@ -690,6 +798,8 @@ mod tests {
             kind: RADType::HttpGet,
             url: "https://www.sofascore.com/event/8397714/json".to_string(),
             script: packed_script_r,
+            body: vec![],
+            headers: vec![],
         };
         let response = r#"{"event":{"homeTeam":{"name":"Ryazan-VDV","slug":"ryazan-vdv","gender":"F","national":false,"id":171120,"shortName":"Ryazan-VDV","subTeams":[]},"awayTeam":{"name":"Olympique Lyonnais","slug":"olympique-lyonnais","gender":"F","national":false,"id":26245,"shortName":"Lyon","subTeams":[]},"homeScore":{"current":0,"display":0,"period1":0,"normaltime":0},"awayScore":{"current":9,"display":9,"period1":5,"normaltime":9}}}"#;
         let retrieved = run_retrieval_with_data(
@@ -1084,8 +1194,69 @@ mod tests {
     #[test]
     fn test_header_correctly_set() {
         let test_header = UserAgent::random();
-        let req = surf::get("https://httpbin.org/get?page=2").set_header("User-Agent", test_header);
-        assert_eq!(req.header("User-Agent"), Some(test_header));
+        let req = surf::get("https://httpbin.org/get?page=2")
+            .header("User-Agent", test_header)
+            .build();
+        assert_eq!(
+            req.header("User-Agent")
+                .map(|x| x.iter().map(|x| x.as_str()).collect()),
+            Some(vec![test_header]),
+        );
+    }
+
+    #[test]
+    fn test_user_agent_can_be_overwritten() {
+        let dummy_user_agent = "witnet http client".to_string();
+
+        let retrieve = RADRetrieve {
+            kind: RADType::HttpGet,
+            url: "https://httpbin.org/get?page=2".to_string(),
+            script: vec![128],
+            body: vec![],
+            headers: vec![("User-Agent".to_string(), dummy_user_agent.clone())],
+        };
+
+        let mut context = ReportContext {
+            active_wips: Some(all_wips_active()),
+            ..ReportContext::default()
+        };
+
+        let req = surf::get(&retrieve.url);
+        let req = add_http_headers(req, &retrieve, &mut context).unwrap();
+        let req = req.build();
+        assert_eq!(
+            req.header("User-Agent")
+                .map(|x| x.iter().map(|x| x.as_str()).collect()),
+            Some(vec![dummy_user_agent.as_str()]),
+        );
+    }
+
+    #[test]
+    fn test_repeated_header_uses_last_value() {
+        let retrieve = RADRetrieve {
+            kind: RADType::HttpGet,
+            url: "https://httpbin.org/get?page=2".to_string(),
+            script: vec![128],
+            body: vec![],
+            headers: vec![
+                ("Test-Header".to_string(), "Value1".to_string()),
+                ("Test-Header".to_string(), "Value2".to_string()),
+            ],
+        };
+
+        let mut context = ReportContext {
+            active_wips: Some(all_wips_active()),
+            ..ReportContext::default()
+        };
+
+        let req = surf::get(&retrieve.url);
+        let req = add_http_headers(req, &retrieve, &mut context).unwrap();
+        let req = req.build();
+        assert_eq!(
+            req.header("Test-Header")
+                .map(|x| x.iter().map(|x| x.as_str()).collect()),
+            Some(vec!["Value2"]),
+        );
     }
 
     /// Test try_data_request with a RNG source
@@ -1097,6 +1268,8 @@ mod tests {
                 kind: RADType::Rng,
                 url: String::from(""),
                 script: vec![128],
+                body: vec![],
+                headers: vec![],
             }],
             aggregate: RADAggregate {
                 filters: vec![],
@@ -1115,5 +1288,244 @@ mod tests {
         } else {
             panic!("No RadonBytes result in a RNG request");
         }
+    }
+
+    #[test]
+    fn test_try_data_request_http_post_non_ascii_header_key() {
+        let script_r = Value::Array(vec![]);
+        let packed_script_r = serde_cbor::to_vec(&script_r).unwrap();
+        let body = Vec::from(String::from(""));
+        let headers = vec![("ñ", "value")];
+        let headers = headers
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let request = RADRequest {
+            time_lock: 0,
+            retrieve: vec![RADRetrieve {
+                kind: RADType::HttpPost,
+                url: String::from("http://127.0.0.1"),
+                script: packed_script_r,
+                body,
+                headers,
+            }],
+            aggregate: RADAggregate {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+            tally: RADTally {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+        };
+        let report = try_data_request(&request, RadonScriptExecutionSettings::enable_all(), None);
+        let tally_result = report.tally.into_inner();
+
+        assert_eq!(
+            tally_result,
+            RadonTypes::RadonError(
+                RadonError::try_from(RadError::UnhandledIntercept {
+                    inner: Some(Box::new(RadError::InvalidHttpHeader {
+                        name: "ñ".to_string(),
+                        value: "value".to_string(),
+                        error: "invalid HTTP header name".to_string()
+                    })),
+                    message: None
+                })
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_try_data_request_http_post_non_ascii_header_value() {
+        let script_r = Value::Array(vec![]);
+        let packed_script_r = serde_cbor::to_vec(&script_r).unwrap();
+        let body = Vec::from(String::from(""));
+        let headers = vec![("key", "ñ")];
+        let headers = headers
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let request = RADRequest {
+            time_lock: 0,
+            retrieve: vec![RADRetrieve {
+                kind: RADType::HttpPost,
+                url: String::from("http://127.0.0.1"),
+                script: packed_script_r,
+                body,
+                headers,
+            }],
+            aggregate: RADAggregate {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+            tally: RADTally {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+        };
+        let report = try_data_request(&request, RadonScriptExecutionSettings::enable_all(), None);
+        let tally_result = report.tally.into_inner();
+
+        assert_eq!(
+            tally_result,
+            RadonTypes::RadonError(
+                RadonError::try_from(RadError::UnhandledIntercept {
+                    inner: Some(Box::new(RadError::InvalidHttpHeader {
+                        name: "key".to_string(),
+                        value: "ñ".to_string(),
+                        error: "String slice should be valid ASCII".to_string()
+                    })),
+                    message: None
+                })
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_try_data_request_http_post_header_colon() {
+        let script_r = Value::Array(vec![]);
+        let packed_script_r = serde_cbor::to_vec(&script_r).unwrap();
+        let body = Vec::from(String::from(""));
+        let headers = vec![("malformed:header", "value")];
+        let headers = headers
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let request = RADRequest {
+            time_lock: 0,
+            retrieve: vec![RADRetrieve {
+                kind: RADType::HttpPost,
+                url: String::from("http://127.0.0.1"),
+                script: packed_script_r,
+                body,
+                headers,
+            }],
+            aggregate: RADAggregate {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+            tally: RADTally {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+        };
+        let report = try_data_request(&request, RadonScriptExecutionSettings::enable_all(), None);
+        let tally_result = report.tally.into_inner();
+
+        assert_eq!(
+            tally_result,
+            RadonTypes::RadonError(
+                RadonError::try_from(RadError::UnhandledIntercept {
+                    inner: Some(Box::new(RadError::InvalidHttpHeader {
+                        name: "malformed:header".to_string(),
+                        value: "value".to_string(),
+                        error: "invalid HTTP header name".to_string()
+                    })),
+                    message: None
+                })
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_try_data_request_http_post_header_value_newline() {
+        let script_r = Value::Array(vec![]);
+        let packed_script_r = serde_cbor::to_vec(&script_r).unwrap();
+        let body = Vec::from(String::from(""));
+        let headers = vec![("malformed-header", "value\nvalue2")];
+        let headers = headers
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let request = RADRequest {
+            time_lock: 0,
+            retrieve: vec![RADRetrieve {
+                kind: RADType::HttpPost,
+                url: String::from("http://127.0.0.1"),
+                script: packed_script_r,
+                body,
+                headers,
+            }],
+            aggregate: RADAggregate {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+            tally: RADTally {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+        };
+        let report = try_data_request(&request, RadonScriptExecutionSettings::enable_all(), None);
+        let tally_result = report.tally.into_inner();
+
+        assert_eq!(
+            tally_result,
+            RadonTypes::RadonError(
+                RadonError::try_from(RadError::UnhandledIntercept {
+                    inner: Some(Box::new(RadError::InvalidHttpHeader {
+                        name: "malformed-header".to_string(),
+                        value: "value\nvalue2".to_string(),
+                        error: "failed to parse header value".to_string()
+                    })),
+                    message: None
+                })
+                .unwrap()
+            )
+        );
+    }
+
+    /// Ensure that `try_data_request` filters errors before calling `run_aggregation`.
+    #[test]
+    fn test_try_data_request_filters_aggregation_errors() {
+        let script = cbor_to_vec(&Value::Array(vec![Value::Integer(
+            RadonOpCodes::StringAsInteger as i128,
+        )]))
+        .unwrap();
+        let request = RADRequest {
+            time_lock: 0,
+            retrieve: vec![
+                RADRetrieve {
+                    kind: RADType::HttpGet,
+                    url: String::from(""),
+                    script: script.clone(),
+                    body: vec![],
+                    headers: vec![],
+                },
+                RADRetrieve {
+                    kind: RADType::HttpGet,
+                    url: String::from(""),
+                    script: script.clone(),
+                    body: vec![],
+                    headers: vec![],
+                },
+                RADRetrieve {
+                    kind: RADType::HttpGet,
+                    url: String::from(""),
+                    script,
+                    body: vec![],
+                    headers: vec![],
+                },
+            ],
+            aggregate: RADAggregate {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+            tally: RADTally {
+                filters: vec![],
+                reducer: RadonReducers::Mode as u32,
+            },
+        };
+        let report = try_data_request(
+            &request,
+            RadonScriptExecutionSettings::enable_all(),
+            Some(&["1", "1", "error"]),
+        );
+        let tally_result = report.tally.into_inner();
+
+        assert_eq!(tally_result, RadonTypes::Integer(RadonInteger::from(1)));
     }
 }

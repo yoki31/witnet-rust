@@ -12,10 +12,6 @@ use bech32::{FromBase32, ToBase32};
 use bls_signatures_rs::{bn256, bn256::Bn256, MultiSignature};
 use failure::Fail;
 use ordered_float::OrderedFloat;
-use secp256k1::{
-    PublicKey as Secp256k1_PublicKey, SecretKey as Secp256k1_SecretKey,
-    Signature as Secp256k1_Signature,
-};
 use serde::{Deserialize, Serialize};
 
 use partial_struct::PartialStruct;
@@ -23,6 +19,10 @@ use witnet_crypto::{
     hash::{calculate_sha256, Sha256},
     key::ExtendedSK,
     merkle::merkle_tree_root as crypto_merkle_tree_root,
+    secp256k1::{
+        PublicKey as Secp256k1_PublicKey, SecretKey as Secp256k1_SecretKey,
+        Signature as Secp256k1_Signature,
+    },
 };
 use witnet_protected::Protected;
 use witnet_reputation::{ActiveReputationSet, TotalReputationSet};
@@ -45,7 +45,7 @@ use crate::{
     transaction::{
         MemoHash, MemoizedHashable, BETA, COMMIT_WEIGHT, OUTPUT_SIZE, REVEAL_WEIGHT, TALLY_WEIGHT,
     },
-    utxo_pool::{OwnUnspentOutputsPool, UnspentOutputsPool},
+    utxo_pool::{OldUnspentOutputsPool, OwnUnspentOutputsPool, UnspentOutputsPool},
     vrf::{BlockEligibilityClaim, DataRequestEligibilityClaim},
 };
 
@@ -1623,6 +1623,9 @@ pub enum RADType {
     /// Random number generation
     #[serde(rename = "RNG")]
     Rng,
+    /// HTTP POST request
+    #[serde(rename = "HTTP-POST")]
+    HttpPost,
 }
 
 impl Default for RADType {
@@ -1665,7 +1668,7 @@ impl RADRequest {
 }
 
 /// Retrieve script and source
-#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, ProtobufConvert, Hash, Default)]
+#[derive(Debug, Eq, PartialEq, Clone, ProtobufConvert, Hash, Default)]
 #[protobuf_convert(
     pb = "witnet::DataRequestOutput_RADRequest_RADRetrieve",
     crate = "crate"
@@ -1677,16 +1680,168 @@ pub struct RADRetrieve {
     pub url: String,
     /// Serialized RADON script
     pub script: Vec<u8>,
+    /// Body of a HTTP-POST request
+    pub body: Vec<u8>,
+    /// Extra headers of a HTTP-GET or HTTP-POST request
+    pub headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+enum Field {
+    Kind,
+    Url,
+    Script,
+    Body,
+    Headers,
+}
+
+impl std::fmt::Display for Field {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Field::Kind => write!(f, "kind"),
+            Field::Url => write!(f, "url"),
+            Field::Script => write!(f, "script"),
+            Field::Body => write!(f, "body"),
+            Field::Headers => write!(f, "headers"),
+        }
+    }
 }
 
 impl RADRetrieve {
+    fn field_checker(&self) -> impl Fn(&[Field], &[Field]) -> Result<(), DataRequestError> + '_ {
+        fn is_default<T: Default + PartialEq>(x: &T) -> bool {
+            x == &T::default()
+        }
+
+        fn hs_to_string(hs: &HashSet<Field>) -> String {
+            let mut s = String::new();
+            let mut field_names: Vec<String> = hs.iter().map(|field| field.to_string()).collect();
+            field_names.sort();
+
+            for field in field_names {
+                s.push_str(&format!("{}, ", field));
+            }
+
+            // Remove last ", "
+            if !s.is_empty() {
+                s.truncate(s.len() - 2);
+            }
+
+            s
+        }
+
+        // Initialize list of present fields with all the fields that have a non-default value
+        let mut present_fields = HashSet::new();
+
+        if !is_default(&self.kind) {
+            present_fields.insert(Field::Kind);
+        }
+        if !is_default(&self.url) {
+            present_fields.insert(Field::Url);
+        }
+        if !is_default(&self.script) {
+            present_fields.insert(Field::Script);
+        }
+        if !is_default(&self.body) {
+            present_fields.insert(Field::Body);
+        }
+        if !is_default(&self.headers) {
+            present_fields.insert(Field::Headers);
+        }
+
+        move |expected_fields: &[Field], optional_fields: &[Field]| {
+            let expected_fields: HashSet<Field> = expected_fields.iter().cloned().collect();
+            let optional_fields: HashSet<Field> = optional_fields.iter().cloned().collect();
+
+            // This must hold true:
+            // present_fields - optional_fields == expected_fields
+            let diff: HashSet<Field> = present_fields
+                .difference(&optional_fields)
+                .cloned()
+                .collect();
+            if diff == expected_fields {
+                Ok(())
+            } else {
+                Err(DataRequestError::MalformedRetrieval {
+                    kind: self.kind.clone(),
+                    expected_fields: hs_to_string(&expected_fields),
+                    actual_fields: hs_to_string(&diff),
+                })
+            }
+        }
+    }
+    /// Check whether the fields of the `RADRetrieve` are compatible with the kind of retrieval.
+    ///
+    /// Returns an error if any of the fields that should not exist (because they cannot be used
+    /// for this retrieval kind) has a value different from the default.
+    pub fn check_fields(&self) -> Result<(), DataRequestError> {
+        let check = self.field_checker();
+
+        match &self.kind {
+            RADType::Unknown => {
+                // Anything is fine
+                Ok(())
+            }
+            RADType::HttpGet => check(&[Field::Kind, Field::Url, Field::Script], &[Field::Headers]),
+            RADType::Rng => check(&[Field::Kind, Field::Script], &[]),
+            RADType::HttpPost => {
+                // In HttpPost the body is optional because empty body should also be allowed
+                check(
+                    &[Field::Kind, Field::Url, Field::Script],
+                    &[Field::Body, Field::Headers],
+                )
+            }
+        }
+    }
+
+    /// Check whether the fields of the `RADRetrieve` are compatible with the kind of retrieval.
+    ///
+    /// Returns an error if any of the fields that should not exist (because they cannot be used
+    /// for this retrieval kind) has a value different from the default.
+    ///
+    /// This is used to ensure that new fields added in WIP0020 are considered invalid before the
+    /// WIP activation.
+    pub fn check_fields_before_wip0020(&self) -> Result<(), DataRequestError> {
+        let check = self.field_checker();
+
+        match &self.kind {
+            RADType::Unknown => {
+                // Anything is fine. This branch can only be reached before WIP0019, when validating
+                // requests from old blocks.
+                Ok(())
+            }
+            RADType::HttpGet => check(&[Field::Kind, Field::Url, Field::Script], &[]),
+            // There was a bug, and RNG requests could have an optional url field which was ignored
+            RADType::Rng => check(&[Field::Kind, Field::Script], &[Field::Url]),
+            _ => Err(DataRequestError::InvalidRadType),
+        }
+    }
+
     /// Return the weight, used to enforce the block size limit.
     pub fn weight(&self) -> u32 {
-        // RADType: 1 byte
+        let kind_weight = 1;
         let script_weight = u32::try_from(self.script.len()).unwrap_or(u32::MAX);
         let url_weight = u32::try_from(self.url.len()).unwrap_or(u32::MAX);
+        let body_weight = u32::try_from(self.body.len()).unwrap_or(u32::MAX);
+        let mut headers_weight: u32 = 0;
+        for (key, value) in &self.headers {
+            let key_weight = u32::try_from(key.len()).unwrap_or(u32::MAX);
+            let value_weight = u32::try_from(value.len()).unwrap_or(u32::MAX);
+            // Approximation of the protobuf serialization overhead of `repeated StringPair`.
+            // See `rad_retrieve_header_overhead` test for more information.
+            let header_overhead = 6;
 
-        script_weight.saturating_add(url_weight).saturating_add(1)
+            headers_weight = headers_weight
+                .saturating_add(key_weight)
+                .saturating_add(value_weight)
+                .saturating_add(header_overhead);
+        }
+
+        script_weight
+            .saturating_add(url_weight)
+            .saturating_add(kind_weight)
+            .saturating_add(body_weight)
+            .saturating_add(headers_weight)
     }
 }
 
@@ -3058,7 +3213,7 @@ pub struct ChainState {
     /// Blockchain information data structure
     pub chain_info: Option<ChainInfo>,
     /// Unspent Outputs Pool
-    pub unspent_outputs_pool: UnspentOutputsPool,
+    pub unspent_outputs_pool_old_migration_db: OldUnspentOutputsPool,
     /// Collection of state structures for active data requests
     pub data_request_pool: DataRequestPool,
     /// List of consolidated blocks by epoch
@@ -3076,6 +3231,9 @@ pub struct ChainState {
     pub superblock_state: SuperBlockState,
     /// TAPI Engine
     pub tapi_engine: TapiEngine,
+    /// Unspent Outputs Pool
+    #[serde(skip)]
+    pub unspent_outputs_pool: UnspentOutputsPool,
 }
 
 impl ChainState {
@@ -3695,86 +3853,6 @@ pub fn penalize_factor(
     }
 }
 
-fn update_utxo_inputs(utxo: &mut UnspentOutputsPool, inputs: &[Input]) {
-    for input in inputs {
-        // Obtain the OutputPointer of each input and remove it from the utxo_set
-        let output_pointer = input.output_pointer();
-
-        // This does not check for missing inputs
-        utxo.remove(output_pointer);
-    }
-}
-
-fn update_utxo_outputs(
-    utxo: &mut UnspentOutputsPool,
-    outputs: &[ValueTransferOutput],
-    txn_hash: Hash,
-    block_number: u32,
-) {
-    for (index, output) in outputs.iter().enumerate() {
-        // Add the new outputs to the utxo_set
-        let output_pointer = OutputPointer {
-            transaction_id: txn_hash,
-            output_index: u32::try_from(index).unwrap(),
-        };
-
-        utxo.insert(output_pointer, output.clone(), block_number);
-    }
-}
-
-/// Method to update the unspent outputs pool
-pub fn generate_unspent_outputs_pool(
-    unspent_outputs_pool: &UnspentOutputsPool,
-    transactions: &[Transaction],
-    block_number: u32,
-) -> UnspentOutputsPool {
-    // Create a copy of the state "unspent_outputs_pool"
-    let mut unspent_outputs = unspent_outputs_pool.clone();
-
-    for transaction in transactions {
-        let txn_hash = transaction.hash();
-        match transaction {
-            Transaction::ValueTransfer(vt_transaction) => {
-                update_utxo_inputs(&mut unspent_outputs, &vt_transaction.body.inputs);
-                update_utxo_outputs(
-                    &mut unspent_outputs,
-                    &vt_transaction.body.outputs,
-                    txn_hash,
-                    block_number,
-                );
-            }
-            Transaction::DataRequest(dr_transaction) => {
-                update_utxo_inputs(&mut unspent_outputs, &dr_transaction.body.inputs);
-                update_utxo_outputs(
-                    &mut unspent_outputs,
-                    &dr_transaction.body.outputs,
-                    txn_hash,
-                    block_number,
-                );
-            }
-            Transaction::Tally(tally_transaction) => {
-                update_utxo_outputs(
-                    &mut unspent_outputs,
-                    &tally_transaction.outputs,
-                    txn_hash,
-                    block_number,
-                );
-            }
-            Transaction::Mint(mint_transaction) => {
-                update_utxo_outputs(
-                    &mut unspent_outputs,
-                    &mint_transaction.outputs,
-                    txn_hash,
-                    block_number,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    unspent_outputs
-}
-
 /// Constants used to convert between epoch and timestamp
 #[derive(Copy, Clone, Debug)]
 pub struct EpochConstants {
@@ -4298,7 +4376,7 @@ mod tests {
     #[test]
     fn secp256k1_from_into_secpk256k1_signatures() {
         use crate::chain::Secp256k1Signature;
-        use secp256k1::{
+        use witnet_crypto::secp256k1::{
             Message as Secp256k1_Message, Secp256k1, SecretKey as Secp256k1_SecretKey,
             Signature as Secp256k1_Signature,
         };
@@ -4319,7 +4397,7 @@ mod tests {
     #[test]
     fn secp256k1_from_into_signatures() {
         use crate::chain::Signature;
-        use secp256k1::{
+        use witnet_crypto::secp256k1::{
             Message as Secp256k1_Message, Secp256k1, SecretKey as Secp256k1_SecretKey,
             Signature as Secp256k1_Signature,
         };
@@ -4340,7 +4418,7 @@ mod tests {
     #[test]
     fn secp256k1_from_into_public_keys() {
         use crate::chain::PublicKey;
-        use secp256k1::{
+        use witnet_crypto::secp256k1::{
             PublicKey as Secp256k1_PublicKey, Secp256k1, SecretKey as Secp256k1_SecretKey,
         };
 
@@ -4358,7 +4436,7 @@ mod tests {
     #[test]
     fn secp256k1_from_into_secret_keys() {
         use crate::chain::SecretKey;
-        use secp256k1::SecretKey as Secp256k1_SecretKey;
+        use witnet_crypto::secp256k1::SecretKey as Secp256k1_SecretKey;
 
         let secret_key =
             Secp256k1_SecretKey::from_slice(&[0xcd; 32]).expect("32 bytes, within curve order");
@@ -5591,140 +5669,6 @@ mod tests {
         assert_eq!(rep_engine.threshold_factor(7), 50);
         assert_eq!(rep_engine.threshold_factor(8), 100);
         assert_eq!(rep_engine.threshold_factor(9), u32::max_value());
-    }
-
-    #[test]
-    fn utxo_set_coin_age() {
-        let mut p = UnspentOutputsPool::default();
-        let v = || ValueTransferOutput::default();
-
-        let k0: OutputPointer =
-            "0222222222222222222222222222222222222222222222222222222222222222:0"
-                .parse()
-                .unwrap();
-        p.insert(k0.clone(), v(), 0);
-        assert_eq!(p.included_in_block_number(&k0), Some(0));
-
-        let k1: OutputPointer =
-            "1222222222222222222222222222222222222222222222222222222222222222:0"
-                .parse()
-                .unwrap();
-        p.insert(k1.clone(), v(), 1);
-        assert_eq!(p.included_in_block_number(&k1), Some(1));
-
-        // k2 points to the same transaction as k1, so they must have the same coin age
-        let k2: OutputPointer =
-            "1222222222222222222222222222222222222222222222222222222222222222:1"
-                .parse()
-                .unwrap();
-        p.insert(k2.clone(), v(), 1);
-        assert_eq!(p.included_in_block_number(&k2), Some(1));
-
-        // Removing k2 should not affect k1
-        p.remove(&k2);
-        assert_eq!(p.included_in_block_number(&k2), None);
-        assert_eq!(p.included_in_block_number(&k1), Some(1));
-        assert_eq!(p.included_in_block_number(&k0), Some(0));
-
-        p.remove(&k1);
-        assert_eq!(p.included_in_block_number(&k2), None);
-        assert_eq!(p.included_in_block_number(&k1), None);
-        assert_eq!(p.included_in_block_number(&k0), Some(0));
-
-        p.remove(&k0);
-        assert_eq!(p.included_in_block_number(&k0), None);
-
-        assert_eq!(p, UnspentOutputsPool::default());
-    }
-
-    #[test]
-    fn utxo_set_insert_twice() {
-        // Inserting the same input twice into the UTXO set overwrites the transaction
-        let mut p = UnspentOutputsPool::default();
-        let v = || ValueTransferOutput::default();
-
-        let k0: OutputPointer =
-            "0222222222222222222222222222222222222222222222222222222222222222:0"
-                .parse()
-                .unwrap();
-        p.insert(k0.clone(), v(), 0);
-        p.insert(k0.clone(), v(), 0);
-        assert_eq!(p.included_in_block_number(&k0), Some(0));
-        // Removing once is enough
-        p.remove(&k0);
-        assert_eq!(p.included_in_block_number(&k0), None);
-    }
-
-    #[test]
-    fn utxo_set_insert_same_transaction_different_epoch() {
-        // Inserting the same transaction twice with different indexes means a different UTXO
-        // so, each UTXO keeps their own block number
-        let mut p = UnspentOutputsPool::default();
-        let v = || ValueTransferOutput::default();
-
-        let k0: OutputPointer =
-            "0222222222222222222222222222222222222222222222222222222222222222:0"
-                .parse()
-                .unwrap();
-        p.insert(k0.clone(), v(), 0);
-        assert_eq!(p.included_in_block_number(&k0), Some(0));
-        let k1: OutputPointer =
-            "0222222222222222222222222222222222222222222222222222222222222222:1"
-                .parse()
-                .unwrap();
-
-        p.insert(k1.clone(), v(), 1);
-        assert_eq!(p.included_in_block_number(&k1), Some(1));
-    }
-
-    #[test]
-    fn test_sort_own_utxos() {
-        let vto1 = ValueTransferOutput {
-            value: 100,
-            ..ValueTransferOutput::default()
-        };
-        let vto2 = ValueTransferOutput {
-            value: 500,
-            ..ValueTransferOutput::default()
-        };
-        let vto3 = ValueTransferOutput {
-            value: 200,
-            ..ValueTransferOutput::default()
-        };
-        let vto4 = ValueTransferOutput {
-            value: 300,
-            ..ValueTransferOutput::default()
-        };
-
-        let vt = Transaction::ValueTransfer(VTTransaction::new(
-            VTTransactionBody::new(vec![], vec![vto1, vto2, vto3, vto4]),
-            vec![],
-        ));
-
-        let utxo_pool = generate_unspent_outputs_pool(&UnspentOutputsPool::default(), &[vt], 0);
-        assert_eq!(utxo_pool.iter().len(), 4);
-
-        let mut own_utxos = OwnUnspentOutputsPool::default();
-        for (o, _) in utxo_pool.iter() {
-            own_utxos.insert(o.clone(), 0);
-        }
-        assert_eq!(own_utxos.len(), 4);
-
-        let sorted_bigger = own_utxos.sort(&utxo_pool, true);
-        let mut aux = 1000;
-        for o in sorted_bigger.iter() {
-            let value = utxo_pool.get(o).unwrap().value;
-            assert!(value < aux);
-            aux = value;
-        }
-
-        let sorted_lower = own_utxos.sort(&utxo_pool, false);
-        let mut aux = 0;
-        for o in sorted_lower.iter() {
-            let value = utxo_pool.get(o).unwrap().value;
-            assert!(value > aux);
-            aux = value;
-        }
     }
 
     #[test]

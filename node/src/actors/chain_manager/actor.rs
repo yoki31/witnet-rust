@@ -1,5 +1,5 @@
 use actix::prelude::*;
-use std::{str::FromStr, time::Duration};
+use std::{pin::Pin, str::FromStr, time::Duration};
 
 use super::{handlers::EveryEpochPayload, ChainManager};
 use crate::{
@@ -24,7 +24,7 @@ use witnet_data_structures::{
     utxo_pool::OwnUnspentOutputsPool,
     vrf::VrfCtx,
 };
-
+use witnet_storage::storage::WriteBatch;
 use witnet_util::timestamp::pretty_print;
 
 /// Implement Actor trait for `ChainManager`
@@ -35,6 +35,8 @@ impl Actor for ChainManager {
     /// Method to be executed when the actor is started
     fn started(&mut self, ctx: &mut Self::Context) {
         log::debug!("ChainManager actor has been started!");
+
+        ctx.wait(Self::check_only_one_chain_state_in_storage().into_actor(self));
 
         self.initialize_from_storage(ctx);
 
@@ -61,14 +63,17 @@ impl ChainManager {
     /// (initialize to Default values if empty)
     pub fn initialize_from_storage(&mut self, ctx: &mut Context<ChainManager>) {
         let fut = self
-            .initialize_from_storage_fut()
+            .initialize_from_storage_fut(false)
             .map(|_res, _act, _ctx| ());
         ctx.wait(fut);
     }
 
     /// Get configuration from ConfigManager and try to initialize ChainManager state from Storage
     /// (initialize to Default values if empty)
-    pub fn initialize_from_storage_fut(&mut self) -> ResponseActFuture<Self, Result<(), ()>> {
+    pub fn initialize_from_storage_fut(
+        &mut self,
+        resync: bool,
+    ) -> ResponseActFuture<Self, Result<(), ()>> {
         let fut = config_mngr::get()
             .into_actor(self)
             .map_err(|err, _act, _ctx| {
@@ -130,7 +135,7 @@ impl ChainManager {
                         actix::fut::ok(result)
                     })
             })
-            .map_ok(move |(chain_state_from_storage, config), act, ctx| {
+            .map_ok(move |(chain_state_from_storage, config), _act, _ctx| {
                 // Get environment and consensus_constants parameters from config
                 let environment = config.environment;
                 let consensus_constants = &config.consensus_constants;
@@ -225,6 +230,85 @@ impl ChainManager {
                     }
                 };
 
+                (chain_state, config)
+            })
+            .and_then(move |(chain_state, config), act, _ctx| {
+                // Get storage backend for unspent_outputs_pool.
+                // Avoid call to storage_mngr if the backend is already in memory.
+                let fut: Pin<Box<dyn ActorFuture<Self, Output = Result<_, ()>>>> = if let Some(x) = act.chain_state.unspent_outputs_pool.db.take() {
+                    Box::pin(actix::fut::ok(x))
+                } else {
+                    Box::pin(storage_mngr::get_backend()
+                        .into_actor(act)
+                        .map_err(|err, _act, _ctx| {
+                            log::error!("Failed to get storage backend: {}", err);
+                        }))
+                };
+
+                fut.map_ok(move |backend, _act, _ctx| (chain_state, config, backend))
+            })
+            .and_then(move |(mut chain_state, config, backend), act, _ctx| {
+                chain_state.unspent_outputs_pool.db = Some(backend);
+
+                let fut: Pin<Box<dyn ActorFuture<Self, Output = Result<ChainState, ()>>>> = if !chain_state.unspent_outputs_pool_old_migration_db.is_empty() {
+                    log::info!("Detected some UTXOs stored in memory, performing migration to store all UTXOs in database");
+                    // In case a previous attempt to perform this migration was interrupted, remove
+                    // all the existing UTXOs from database first.
+                    let removed_utxos = chain_state.unspent_outputs_pool.delete_all_from_db();
+                    if removed_utxos > 0 {
+                        log::warn!(
+                            "Found {} UTXOs already in the database. Assuming that this is \
+                            because a previous migration was interrupted, the UTXOs have \
+                            been deleted and the migration will restart from scratch.",
+                            removed_utxos
+                        );
+                    }
+                    chain_state
+                        .unspent_outputs_pool
+                        .migrate_old_unspent_outputs_pool_to_db(
+                            &mut chain_state.unspent_outputs_pool_old_migration_db,
+                            |i, total| {
+                                if i % 10000 == 0 {
+                                    log::info!(
+                                        "UTXO set migration v3: [{}/{}]",
+                                        i,
+                                        total,
+                                    );
+                                }
+                            }
+                        );
+                    log::info!("Migration completed successfully, saving updated ChainState");
+                    // Write the chain state again right after this migration, to ensure that the
+                    // migration is only executed once
+                    let fut = storage_mngr::put_chain_state_in_batch(
+                        &storage_keys::chain_state_key(act.get_magic()),
+                        &chain_state,
+                        WriteBatch::default(),
+                    )
+                        .into_actor(act)
+                        .and_then(|_, _, _| {
+                            log::debug!("Successfully persisted chain_state into storage");
+                            fut::ok(chain_state)
+                        })
+                        .map_err(|err, _, _| {
+                            log::error!(
+                    "Failed to persist chain_state into storage: {}",
+                    err
+                )
+                        });
+
+                    Box::pin(fut)
+                } else {
+                    Box::pin(actix::fut::ok(chain_state))
+                };
+
+                fut
+                .map_ok(move |chain_state, _act, _ctx| {
+                    (chain_state, config)
+                })
+            })
+            .map_ok(move |(chain_state, config), act, ctx| {
+                let consensus_constants = &config.consensus_constants;
                 let chain_info = chain_state.chain_info.as_ref().unwrap();
                 log::info!(
                     "Actual ChainState CheckpointBeacon: epoch ({}), hash_block ({})",
@@ -232,11 +316,10 @@ impl ChainManager {
                     chain_info.highest_block_checkpoint.hash_prev_block
                 );
 
-                // If hash_prev_block is the bootstrap hash, create and consolidate genesis block
-                if chain_info.highest_block_checkpoint.hash_prev_block == consensus_constants.bootstrap_hash {
-                    // Create genesis block
-                    // TODO: consolidating the genesis block is not needed if the chain state has
-                    // been reset because of a rewind
+                // If hash_prev_block is the bootstrap hash, create and consolidate genesis block.
+                // Consolidating the genesis block is not needed if the chain state has been reset
+                // because of a rewind: the genesis block will be processed with the other blocks.
+                if !resync && chain_info.highest_block_checkpoint.hash_prev_block == consensus_constants.bootstrap_hash {
                     let info_genesis =
                         GenesisBlockInfo::from_path(&config.mining.genesis_path, consensus_constants.bootstrap_hash, consensus_constants.genesis_hash)
                             .map_err(|e| {
@@ -303,6 +386,97 @@ impl ChainManager {
             });
 
         Box::pin(fut)
+    }
+
+    /// Ensure that there is only one ChainState in the storage. Old versions of witnet-rust used
+    /// to allow having multiple ChainStates for multiple testnets. This function will panic in that
+    /// case because multiple ChainStates are incompatible with storing UTXOs as keys in the
+    /// database.
+    pub async fn check_only_one_chain_state_in_storage() {
+        let config = config_mngr::get().await.unwrap_or_else(|err| {
+            panic!("Couldn't get config: {}", err);
+        });
+
+        let backend = storage_mngr::get_backend().await.unwrap_or_else(|err| {
+            panic!("Failed to get storage backend: {}", err);
+        });
+
+        let magic = config.consensus_constants.get_magic();
+
+        // The key prefix depends on the length of the number when converted to string, so we need
+        // to check all the possible lengths for numbers between 0 and 65535.
+        // Luckily there are only 5 possible prefixes:
+        let magic_templates = vec![1, 11, 111, 1111, 11111];
+        let all_chain_states: Vec<Vec<u8>> = magic_templates
+            .into_iter()
+            .map(storage_keys::chain_state_key)
+            .map(|key| bincode::serialize(&key).expect("bincode error"))
+            .map(|mut key_bytes| {
+                // Truncate key to 14 bytes. If the key is:
+                // [8 bytes prefix]chain-11111-key
+                // This will truncate right before the "11111":
+                // [8 bytes prefix]chain-
+                // To allow checking all the possible magic numbers
+                key_bytes.truncate(14);
+                key_bytes
+            })
+            .flat_map(|prefix| {
+                backend
+                    .prefix_iterator(&prefix)
+                    .expect("prefix iterator error")
+                    .map(|(k, _v)| k)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        match all_chain_states.len() {
+            0 => {
+                // No ChainState in DB, good
+            }
+            1 => {
+                let expected_magic = storage_keys::chain_state_key(magic);
+                let expected_key = bincode::serialize(&expected_magic).expect("bincode error");
+                let key = &all_chain_states[0];
+                if key == &expected_key {
+                    // One ChainState in DB and matches magic number, good
+                } else {
+                    // One ChainState in DB but does not match magic number, bad.
+                    // We would need to delete existing chain state and all utxos to be able to
+                    // reuse this storage, so ask the user to delete the storage.
+                    let key_str: String =
+                        bincode::deserialize(key).unwrap_or_else(|_e| format!("{:?}", key));
+                    panic!(
+                        "Storage already contains a chain state with different magic number.\n\
+                        Expected magic: {:?}, found in storage: {:?}.\n\
+                        Please backup the master key if needed, delete the storage and try again.\n\
+                        To backup the master key, you need to go back to the previous environment \
+                        (testnet or mainnet) and use the exportMasterKey command.\n\
+                        Help: make sure that the storage folder is not used in multiple environments \
+                        (testnet and mainnet).",
+                        expected_magic, key_str
+                    );
+                }
+            }
+            _ => {
+                // More than one ChainState in DB, bad.
+                // This could lead to UTXOs from one environment being spent on a different
+                // environment, so ask the user to delete the storage.
+                let expected_magic = storage_keys::chain_state_key(magic);
+                let key_strs: Vec<String> = all_chain_states
+                    .iter()
+                    .map(|key| bincode::deserialize(key).unwrap_or_else(|_e| format!("{:?}", key)))
+                    .collect();
+                panic!(
+                    "Storage contains more than one chain state with different magic numbers.\n\
+                    Expected magic: {:?}, found in storage: {:?}.\n\
+                    Please backup the master key if needed, delete the storage and try again.\n\
+                    To backup the master key, downgrade to witnet 1.4.3 and use the exportMasterKey command.\n\
+                    Help: make sure that the storage folder is not used in multiple environments \
+                    (testnet and mainnet).",
+                    expected_magic, key_strs
+                );
+            }
+        }
     }
 
     /// Get epoch constants and current epoch from EpochManager, and subscribe to future epochs
@@ -416,4 +590,118 @@ impl ChainManager {
     }
     #[cfg(not(feature = "telemetry"))]
     fn configure_telemetry_scope(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{actors::storage_keys::chain_state_key, utils::test_actix_system};
+    use std::sync::Arc;
+    use witnet_config::config::{Config, StorageBackend};
+
+    #[test]
+    fn test_check_only_one_chain_state_in_storage_empty_storage() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        test_actix_system(|| async {
+            // Setup testing: use in-memory database instead of rocksdb
+            let mut config = Config::default();
+            config.storage.backend = StorageBackend::HashMap;
+            let config = Arc::new(config);
+            // Start relevant actors
+            config_mngr::start(config);
+            storage_mngr::start();
+
+            ChainManager::check_only_one_chain_state_in_storage().await;
+        });
+    }
+
+    #[test]
+    fn test_check_only_one_chain_state_in_storage_one_ok() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        test_actix_system(|| async {
+            // Setup testing: use in-memory database instead of rocksdb
+            let mut config = Config::default();
+            config.storage.backend = StorageBackend::HashMap;
+            let config = Arc::new(config);
+            let magic = config.consensus_constants.get_magic();
+            // Start relevant actors
+            config_mngr::start(config);
+            storage_mngr::start();
+
+            let chain_manager = ChainManager::default();
+            storage_mngr::put_chain_state_in_batch(
+                &storage_keys::chain_state_key(magic),
+                &chain_manager.chain_state,
+                WriteBatch::default(),
+            )
+            .await
+            .expect("failed to store chain state");
+
+            ChainManager::check_only_one_chain_state_in_storage().await;
+        });
+    }
+
+    #[test]
+    #[should_panic = "Storage already contains a chain state with different magic number"]
+    fn test_check_only_one_chain_state_in_storage_one_different() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        test_actix_system(|| async {
+            // Setup testing: use in-memory database instead of rocksdb
+            let mut config = Config::default();
+            config.storage.backend = StorageBackend::HashMap;
+            let config = Arc::new(config);
+            let magic = config.consensus_constants.get_magic();
+            // Start relevant actors
+            config_mngr::start(config);
+            storage_mngr::start();
+
+            let chain_manager = ChainManager::default();
+            // Change one bit of the magic number to trigger the error
+            let magic = magic ^ 0x01;
+            storage_mngr::put_chain_state_in_batch(
+                &storage_keys::chain_state_key(magic),
+                &chain_manager.chain_state,
+                WriteBatch::default(),
+            )
+            .await
+            .expect("failed to store chain state");
+
+            ChainManager::check_only_one_chain_state_in_storage().await;
+        });
+    }
+
+    #[test]
+    #[should_panic = "Storage contains more than one chain state with different magic numbers"]
+    fn test_check_only_one_chain_state_in_storage_two_chain_states() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        test_actix_system(|| async {
+            // Setup testing: use in-memory database instead of rocksdb
+            let mut config = Config::default();
+            config.storage.backend = StorageBackend::HashMap;
+            let config = Arc::new(config);
+            // Start relevant actors
+            config_mngr::start(config);
+            storage_mngr::start();
+
+            let chain_manager = ChainManager::default();
+            let magic1 = 1;
+            let magic2 = 2;
+            storage_mngr::put_chain_state_in_batch(
+                &chain_state_key(magic1),
+                &chain_manager.chain_state,
+                WriteBatch::default(),
+            )
+            .await
+            .expect("failed to store chain state");
+            storage_mngr::put_chain_state_in_batch(
+                &chain_state_key(magic2),
+                &chain_manager.chain_state,
+                WriteBatch::default(),
+            )
+            .await
+            .expect("failed to store chain state");
+
+            ChainManager::check_only_one_chain_state_in_storage().await;
+        });
+    }
 }

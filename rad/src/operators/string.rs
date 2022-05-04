@@ -1,5 +1,6 @@
 use serde_cbor::value::{from_value, Value};
 use std::{
+    collections::BTreeMap,
     convert::{TryFrom, TryInto},
     str::FromStr,
 };
@@ -12,6 +13,8 @@ use crate::{
         integer::RadonInteger, map::RadonMap, string::RadonString, RadonType, RadonTypes,
     },
 };
+
+const MAX_DEPTH: u8 = 20;
 
 pub fn parse_json(input: &RadonString) -> Result<RadonTypes, RadError> {
     match json::parse(&input.value()) {
@@ -33,6 +36,108 @@ pub fn parse_json_map(input: &RadonString) -> Result<RadonMap, RadError> {
 pub fn parse_json_array(input: &RadonString) -> Result<RadonArray, RadError> {
     let item = parse_json(input)?;
     item.try_into()
+}
+
+fn add_children(
+    map: &mut BTreeMap<String, RadonTypes>,
+    text_children: Vec<RadonTypes>,
+    element_children: Vec<(String, RadonTypes)>,
+) {
+    match text_children.len() {
+        0 => {}
+        1 => {
+            let text_value = text_children.into_iter().next().unwrap();
+            map.insert("_text".to_string(), text_value);
+        }
+        _ => {
+            let text_value = RadonArray::from(text_children).into();
+            map.insert("_text".to_string(), text_value);
+        }
+    }
+
+    for (key, value) in element_children {
+        match map.get_mut(&key) {
+            Some(old_value) => match old_value {
+                RadonTypes::Array(rad_array) => {
+                    let mut new_array = rad_array.value();
+                    new_array.push(value);
+
+                    *rad_array = RadonArray::from(new_array);
+                }
+                x => {
+                    let new_array = vec![x.clone(), value];
+                    *x = RadonArray::from(new_array).into();
+                }
+            },
+            None => {
+                map.insert(key, value);
+            }
+        }
+    }
+}
+
+fn parse_element_map(input: &minidom::Element, depth: u8) -> Result<RadonTypes, RadError> {
+    if depth > MAX_DEPTH {
+        return Err(RadError::XmlParseOverflow);
+    }
+
+    let mut map: BTreeMap<String, RadonTypes> = BTreeMap::new();
+    for (k, v) in input.attrs() {
+        map.insert(format!("@{}", k), RadonString::from(v).into());
+    }
+
+    let mut element_children = vec![];
+    let mut text_children: Vec<RadonTypes> = vec![];
+    for child in input.nodes() {
+        match child {
+            minidom::Node::Element(elem) => {
+                let key = elem.name().to_string();
+                let value = parse_element_map(elem, depth + 1)?;
+
+                element_children.push((key, value));
+            }
+            minidom::Node::Text(text) => {
+                // This check is to avoid blank spaces in xml would be included in the RadonMap
+                let text_var = text.trim().to_string();
+                if !text_var.is_empty() {
+                    text_children.push(RadonString::from(text_var).into());
+                }
+            }
+        }
+    }
+
+    let only_text_children = element_children.is_empty() && map.is_empty();
+
+    if only_text_children {
+        let text_value = match text_children.len() {
+            0 => RadonString::from("").into(),
+            1 => text_children.into_iter().next().unwrap(),
+            _ => RadonArray::from(text_children).into(),
+        };
+
+        Ok(text_value)
+    } else {
+        add_children(&mut map, text_children, element_children);
+        Ok(RadonMap::from(map).into())
+    }
+}
+
+// Parse a XML `RadonString` to a `RadonMap` according to WIP0021 [https://github.com/witnet/WIPs/blob/master/wip-0021.md]
+pub fn parse_xml_map(input: &RadonString) -> Result<RadonMap, RadError> {
+    let minidom_element: Result<minidom::Element, minidom::Error> = input.value().parse();
+
+    match minidom_element {
+        Ok(element) => {
+            let value = parse_element_map(&element, 0)?;
+            let mut main_map: BTreeMap<String, RadonTypes> = BTreeMap::new();
+            main_map.insert(element.name().to_string(), value);
+
+            Ok(RadonMap::from(main_map))
+        }
+        Err(minidom_error) => Err(RadError::XmlParse {
+            description: minidom_error.to_string(),
+        }),
+    }
 }
 
 pub fn radon_trim(input: &RadonString) -> String {
@@ -146,9 +251,7 @@ fn json_to_cbor(value: &json::JsonValue) -> Value {
             let floating = f64::from(*value);
             // Cast the float into an integer if it has no fractional part and its value will fit
             // into the range of `i128` (38 is the biggest power of 10 that `i128` can safely hold)
-            // TODO: after Rust 1.51, use unsigned_abs instead of wrapping_abs and remove this allow
-            #[allow(clippy::cast_sign_loss)]
-            if floating.fract() == 0.0 && (exponent.wrapping_abs() as u16) < 38 {
+            if floating.fract() == 0.0 && exponent.unsigned_abs() < 38 {
                 // This cast is assumed to be safe as per the previous guard
                 Value::Integer(floating as i128)
             } else {
@@ -179,6 +282,151 @@ mod tests {
         let expected_output = RadonMap::from(map);
 
         assert_eq!(output, expected_output);
+    }
+
+    fn create_radon_map(input: Vec<(String, RadonTypes)>) -> RadonTypes {
+        let mut map = BTreeMap::new();
+        for (k, v) in input {
+            map.insert(k.clone(), v);
+        }
+
+        RadonTypes::from(RadonMap::from(map))
+    }
+
+    #[test]
+    fn test_parse_xml_map() {
+        let xml_map = RadonString::from(
+            r#"<?xml version="1.0"?>
+            <Tag xmlns="https://witnet.io/">
+                <InTag attr="0001">
+                    <Name>Witnet</Name>
+                    <Price currency="EUR">0.03</Price>
+                    <Other><Nothing/></Other>
+                </InTag>
+                <InTag attr="0002">
+                    <Name>Bitcoin</Name>
+                    <Price currency="USD">49000</Price>
+                    <Other value="nothing"/>
+                </InTag>
+            </Tag>
+        "#,
+        );
+        let output = parse_xml_map(&xml_map).unwrap();
+
+        let price1_element = create_radon_map(vec![
+            ("@currency".to_string(), RadonString::from("EUR").into()),
+            ("_text".to_string(), RadonString::from("0.03").into()),
+        ]);
+        let other1_element =
+            create_radon_map(vec![("Nothing".to_string(), RadonString::from("").into())]);
+
+        let price2_element = create_radon_map(vec![
+            ("@currency".to_string(), RadonString::from("USD").into()),
+            ("_text".to_string(), RadonString::from("49000").into()),
+        ]);
+        let other2_element = create_radon_map(vec![(
+            "@value".to_string(),
+            RadonString::from("nothing").into(),
+        )]);
+
+        let in_tag1_element = create_radon_map(vec![
+            ("@attr".to_string(), RadonString::from("0001").into()),
+            ("Name".to_string(), RadonString::from("Witnet").into()),
+            ("Price".to_string(), price1_element),
+            ("Other".to_string(), other1_element),
+        ]);
+        let in_tag2_element = create_radon_map(vec![
+            ("@attr".to_string(), RadonString::from("0002").into()),
+            ("Name".to_string(), RadonString::from("Bitcoin").into()),
+            ("Price".to_string(), price2_element),
+            ("Other".to_string(), other2_element),
+        ]);
+
+        let tag_element = create_radon_map(vec![
+            (
+                "@xmlns".to_string(),
+                RadonString::from("https://witnet.io/").into(),
+            ),
+            (
+                "InTag".to_string(),
+                RadonArray::from(vec![in_tag1_element, in_tag2_element]).into(),
+            ),
+        ]);
+
+        let expected_map = create_radon_map(vec![("Tag".to_string(), tag_element)]);
+
+        assert_eq!(RadonTypes::from(output), expected_map);
+    }
+
+    #[test]
+    fn test_parse_xml_map_no_ns() {
+        let xml_map = RadonString::from(
+            r#"<?xml version="1.0"?>
+            <Tag>
+                <InTag attr="0001">
+                    <Name>Witnet</Name>
+                </InTag>
+            </Tag>
+        "#,
+        );
+        let output = parse_xml_map(&xml_map).unwrap();
+
+        let in_tag1_element = create_radon_map(vec![
+            ("@attr".to_string(), RadonString::from("0001").into()),
+            ("Name".to_string(), RadonString::from("Witnet").into()),
+        ]);
+
+        let tag_element = create_radon_map(vec![("InTag".to_string(), in_tag1_element)]);
+
+        let expected_map = create_radon_map(vec![("Tag".to_string(), tag_element)]);
+
+        assert_eq!(RadonTypes::from(output), expected_map);
+    }
+
+    #[test]
+    fn test_parse_xml_map_with_2_ns() {
+        let xml_map = RadonString::from(
+            r#"<?xml version="1.0"?>
+            <Tag xmlns:a="ns_A" xmlns:b="ns_B">
+                <InTag attr="0001">
+                    <Name>Witnet</Name>
+                </InTag>
+            </Tag>
+        "#,
+        );
+        let output = parse_xml_map(&xml_map).unwrap();
+
+        let in_tag1_element = create_radon_map(vec![
+            ("@attr".to_string(), RadonString::from("0001").into()),
+            ("Name".to_string(), RadonString::from("Witnet").into()),
+        ]);
+
+        let tag_element = create_radon_map(vec![
+            ("@xmlns:a".to_string(), RadonString::from("ns_A").into()),
+            ("@xmlns:b".to_string(), RadonString::from("ns_B").into()),
+            ("InTag".to_string(), in_tag1_element),
+        ]);
+
+        let expected_map = create_radon_map(vec![("Tag".to_string(), tag_element)]);
+
+        assert_eq!(RadonTypes::from(output), expected_map);
+    }
+
+    #[test]
+    fn test_parse_xml_map_stack_overflow() {
+        let n = 1000;
+        let xml_map = RadonString::from(format!(
+            r#"<?xml version="1.0"?>
+            <Tests xmlns="https://witnet.io/">
+            {}{}
+            </Tests>
+        "#,
+            "<A>".repeat(n),
+            "</A>".repeat(n)
+        ));
+        let output = parse_xml_map(&xml_map).unwrap_err();
+
+        assert_eq!(output, RadError::XmlParseOverflow)
     }
 
     #[test]
